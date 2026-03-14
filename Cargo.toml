@@ -1,0 +1,30 @@
+[package]
+name = "polymarket-arb2"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22.1"
+dotenvy = "0.15"
+ethers = "2.0.14"
+futures-util = "0.3"
+hex = "0.4.3"
+hmac = "0.12.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10.9"
+tokio = { version = "1.36", features = ["macros", "rt-multi-thread", "time", "sync"] }
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+polymarket-client-sdk = { version = "0.4.2", features = ["ctf"] }
+alloy = { version = "1.5.2", features = ["providers", "reqwest", "signer-local"] }
+argon2 = "0.5"
+aes-gcm = "0.10"
+rpassword = "7"
+getrandom = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
