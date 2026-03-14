@@ -40,6 +40,8 @@ pub struct MarketState {
     pub asset_to_outcome: HashMap<String, String>,
     pub best_asks: HashMap<String, f64>,
     pub mid_prices: HashMap<String, f64>,
+    /// Mid-prices captured at window open (first WS update per asset).
+    pub open_mid_prices: HashMap<String, f64>,
     pub fee_bps: u64,
 }
 
@@ -56,6 +58,7 @@ impl MarketState {
                 .collect(),
             best_asks: HashMap::new(),
             mid_prices: HashMap::new(),
+            open_mid_prices: HashMap::new(),
             fee_bps: 1000,
         }))
     }
@@ -323,6 +326,9 @@ async fn handle_single(state: &Arc<Mutex<MarketState>>, value: &Value) {
             if let Some((asset_id, mid, ask)) = parse_best_bid_ask(value) {
                 let mut g = state.lock().await;
                 if g.asset_to_outcome.contains_key(&asset_id) {
+                    if !g.open_mid_prices.contains_key(&asset_id) {
+                        g.open_mid_prices.insert(asset_id.clone(), mid);
+                    }
                     g.mid_prices.insert(asset_id.clone(), mid);
                     g.best_asks.insert(asset_id, ask);
                     log_prices(&g);

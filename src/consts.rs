@@ -18,11 +18,6 @@ pub const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B898
 pub const CONDITIONAL_TOKENS_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
 pub const USDC_E_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
 
-// ── Chainlink (Ethereum mainnet) ────────────────────────────────────────────
-
-pub const CHAINLINK_BTC_USD: &str = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c";
-pub const LATEST_ANSWER_SELECTOR: &str = "0x50d25bcd";
-
 // ── Polymarket APIs ─────────────────────────────────────────────────────────
 
 pub const GAMMA_API: &str = "https://gamma-api.polymarket.com";
@@ -33,7 +28,6 @@ pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 // ── Environment variable keys ───────────────────────────────────────────────
 
 pub const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
-pub const GETBLOCK_API_KEY_ENV: &str = "GETBLOCK_API_KEY";
 pub const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
 
 // ── POL gas top-up ──────────────────────────────────────────────────────────
@@ -64,6 +58,10 @@ pub const TIERS: [(u64, f64, f64); 3] = [
 
 /// Never pay more than this for an outcome share.
 pub const MAX_BUY_PRICE: f64 = 0.92;
+/// Maximum polymarket price drift from window open before we consider the move
+/// already priced in.  If the outcome we want to bet moved more than this from
+/// its opening mid-price, skip — polymarket already reacted.
+pub const MAX_PM_DRIFT: f64 = 0.10;
 /// Minimum net edge (P_correct - ask - fee) required to bet.
 pub const MIN_EDGE_PCT: f64 = 0.03;
 /// Minimum total ask depth (USD) in top 5 levels to consider betting.
