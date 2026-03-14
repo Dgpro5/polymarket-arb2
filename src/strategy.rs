@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use crate::alerts;
 use crate::consts::*;
-use crate::getblock::BtcPriceState;
+use crate::binance::BtcPriceState;
 use crate::polymarket::{
     MarketState, TradingWallet, build_order_request, calculate_total_ask_size,
     get_order_book, now_ms, place_single_order,
@@ -92,6 +92,20 @@ pub async fn evaluate_bet(
         .iter()
         .find(|(_, outcome)| outcome.eq_ignore_ascii_case(direction))
         .map(|(id, _)| id.clone())?;
+
+    // Check if polymarket already priced in the move
+    if let Some(&open_mid) = ms.open_mid_prices.get(&token_id) {
+        let current_mid = ms.mid_prices.get(&token_id).copied().unwrap_or(open_mid);
+        let drift = current_mid - open_mid;
+        if drift > MAX_PM_DRIFT {
+            eprintln!(
+                "  T-{}s | BTC: {:.4}% {} | PM already moved: {:.2}c → {:.2}c (+{:.2}c) | SKIP",
+                secs_remaining, pct_change, direction,
+                open_mid * 100.0, current_mid * 100.0, drift * 100.0
+            );
+            return None;
+        }
+    }
 
     // Check ask price
     let ask_price = ms.best_asks.get(&token_id).copied().unwrap_or(1.0);

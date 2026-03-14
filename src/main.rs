@@ -2,7 +2,7 @@ mod alerts;
 mod chain;
 mod consts;
 mod encrypt;
-mod getblock;
+mod binance;
 mod polymarket;
 mod strategy;
 
@@ -47,8 +47,8 @@ async fn main() -> Result<()> {
     alerts::send_startup(&client, &wallet_addr, balance).await;
 
     // ── BTC price stream (background) ────────────────────────────────────
-    let btc_state = getblock::BtcPriceState::new_shared();
-    tokio::spawn(getblock::run_price_stream(Arc::clone(&btc_state)));
+    let btc_state = binance::BtcPriceState::new_shared();
+    tokio::spawn(binance::run_price_stream(Arc::clone(&btc_state)));
 
     // ── Main loop: cycle through 5-min windows ──────────────────────────
     let mut backoff = 2u64;
