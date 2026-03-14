@@ -1,7 +1,10 @@
+mod alerts;
 mod chain;
+mod consts;
 mod encrypt;
 mod getblock;
 mod polymarket;
+mod strategy;
 
 use anyhow::{Context, Result};
 use reqwest::Client;
@@ -9,13 +12,7 @@ use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-// Constants kept for future use
-#[allow(dead_code)]
-const DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1473284259363163211/4sgTuuoGlwS4OyJ5x6-QmpPA_Q1gvsIZB9EZrb9zWX6qyA0LMQklz3IupBfINPVnpsMZ";
-#[allow(dead_code)]
-const ERROR_DISCORD_WEBHOOK_URL: &str = "https://discord.com/api/webhooks/1475092817654055084/_mr0tTCdzyyoJtTBwNqE6KYj6SQ0XEegZFv4j5PejJ0vq2i1Vlt0oi7IFmeAt12j0TQW";
-
-const DATA_DIR: &str = "data";
+use consts::DATA_DIR;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -37,17 +34,21 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
     chain::redeem_prior_windows(&client, &private_key).await;
 
-    match chain::get_balance(&client, &wallet.address).await {
-        Ok(b) => eprintln!("Balance: ${:.4}", b),
-        Err(e) => eprintln!("Could not fetch balance: {e:#}"),
-    }
+    let balance = chain::get_balance(&client, &wallet.address)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("Could not fetch balance: {e:#}");
+            0.0
+        });
+    eprintln!("Balance: ${:.4}", balance);
+
+    // ── Startup alert ───────────────────────────────────────────────────
+    let wallet_addr = format!("{:#x}", wallet.address);
+    alerts::send_startup(&client, &wallet_addr, balance).await;
 
     // ── BTC price stream (background) ────────────────────────────────────
     let btc_state = getblock::BtcPriceState::new_shared();
     tokio::spawn(getblock::run_price_stream(Arc::clone(&btc_state)));
-
-    // ── Fee rate refresh (background) ────────────────────────────────────
-    // Will be wired up once a market state exists per window.
 
     // ── Main loop: cycle through 5-min windows ──────────────────────────
     let mut backoff = 2u64;
@@ -83,6 +84,22 @@ async fn main() -> Result<()> {
                     }
                 });
 
+                // Spawn strategy evaluation loop (runs every 1s in final 45s)
+                let strat_btc = Arc::clone(&btc_state);
+                let strat_market = Arc::clone(&state);
+                let strat_wallet = Arc::clone(&wallet);
+                let strat_client = client.clone();
+                let strat_end_ts = market.end_ts;
+                let strat_slug = market.slug.clone();
+                let strat_handle = tokio::spawn(strategy::run_strategy_loop(
+                    strat_btc,
+                    strat_market,
+                    strat_wallet,
+                    strat_client,
+                    strat_end_ts,
+                    strat_slug,
+                ));
+
                 // Run Polymarket WS until window ends or socket closes
                 tokio::select! {
                     result = polymarket::run_market_ws(Arc::clone(&state), &market.asset_ids) => {
@@ -94,6 +111,7 @@ async fn main() -> Result<()> {
                                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                                 backoff = (backoff * 2).min(60);
                                 fee_handle.abort();
+                                strat_handle.abort();
                                 continue;
                             }
                         }
@@ -101,6 +119,7 @@ async fn main() -> Result<()> {
                     _ = tokio::time::sleep(Duration::from_secs(remaining + 3)) => {}
                 }
 
+                strat_handle.abort();
                 fee_handle.abort();
 
                 // Window closed — housekeeping

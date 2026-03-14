@@ -16,21 +16,11 @@ use std::env;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::consts::{
+    ANKR_API_KEY_ENV, CHAIN_ID, CONDITIONAL_TOKENS_ADDRESS, CTF_EXCHANGE_ADDRESS, GAMMA_API,
+    POL_LOW_THRESHOLD, POL_TOP_UP_USDC, SIMPLESWAP_API_KEY_ENV, USDC_E_POLYGON,
+};
 use crate::polymarket::TradingWallet;
-
-// ── Constants (shared via pub(crate)) ────────────────────────────────────────
-
-pub(crate) const CHAIN_ID: u64 = 137;
-pub(crate) const CTF_EXCHANGE_ADDRESS: &str = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-const CONDITIONAL_TOKENS_ADDRESS: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
-pub(crate) const USDC_E_POLYGON: &str = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
-pub(crate) const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
-
-const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
-const POL_LOW_THRESHOLD: f64 = 0.5;
-const POL_TOP_UP_USDC: f64 = 10.0;
-
-const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]

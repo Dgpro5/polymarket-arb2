@@ -19,14 +19,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-use crate::chain::{CHAIN_ID, CTF_EXCHANGE_ADDRESS};
-
-// ── Constants ────────────────────────────────────────────────────────────────
-
-const GAMMA_API: &str = "https://gamma-api.polymarket.com";
-pub(crate) const CLOB_API: &str = "https://clob.polymarket.com";
-const CLOB_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
+use crate::consts::{CHAIN_ID, CLOB_API, CLOB_WS_URL, CTF_EXCHANGE_ADDRESS, GAMMA_API, ZERO_ADDRESS};
 
 // ── Types ────────────────────────────────────────────────────────────────────
 

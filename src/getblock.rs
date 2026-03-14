@@ -14,12 +14,7 @@ use tokio::sync::Mutex;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
-pub(crate) const GETBLOCK_API_KEY_ENV: &str = "GETBLOCK_API_KEY";
-
-// Chainlink BTC/USD Price Feed on Ethereum mainnet (8 decimals).
-const CHAINLINK_BTC_USD: &str = "0xF4030086522a5bEEa4988F8cA5B36dbC97BeE88c";
-// latestAnswer() selector
-const LATEST_ANSWER_SELECTOR: &str = "0x50d25bcd";
+use crate::consts::{CHAINLINK_BTC_USD, GETBLOCK_API_KEY_ENV, LATEST_ANSWER_SELECTOR};
 
 #[derive(Debug)]
 pub struct BtcPriceState {
@@ -41,7 +36,6 @@ impl BtcPriceState {
     }
 
     /// Percent change from window open to now.  Positive = BTC going up.
-    #[allow(dead_code)]
     pub fn pct_change(&self) -> Option<f64> {
         let open = self.window_open_price?;
         if open <= 0.0 {
