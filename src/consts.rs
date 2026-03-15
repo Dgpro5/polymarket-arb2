@@ -54,30 +54,30 @@ pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 /// dynamically:  σ_5min = BTC_ANNUAL_VOL / √(525_600 / 5) ≈ 0.185%.
 /// This drives the confidence (normal CDF) calculation in strategy.rs.
 pub const BTC_ANNUAL_VOL: f64 = 0.60;
-/// Tiered thresholds: (max_secs_remaining, min_pct_change, allocation_fraction).
+
+/// Late tiers (T-45s to T-8s): percentage-based, small moves suffice.
+/// (max_secs_remaining, min_pct_change, allocation_fraction).
 /// Evaluated in order; first match wins.
-///
-/// Two regimes:
-///  1. EARLY (240–45s): big BTC moves — race PM before orderbook reprices.
-///     Thresholds in %, so they work at any BTC price.
-///     At T-240s, 0.20% is ≈ 2.6σ of remaining vol → P(stays) ≈ 99.5%.
-///  2. LATE  (45–8s):  smaller moves suffice because less time to reverse.
-///     PM drift check already filters priced-in moves.
-pub const TIERS: [(u64, f64, f64); 6] = [
-    // ── Late tiers (high confidence, small moves) ──────────────────────
+pub const LATE_TIERS: [(u64, f64, f64); 3] = [
     // 25–8s left: close to expiry, even small confirmed moves are predictive
     (25, 0.02, 0.80),
     // 36–25s left
     (36, 0.03, 0.60),
     // 45–36s left
     (45, 0.05, 0.40),
-    // ── Early tiers (big moves, race the PM orderbook) ─────────────────
-    // 120–45s left: ≈ 1.3σ of remaining vol → P(stays) ≈ 97%
-    (120, 0.10, 0.30),
-    // 180–120s left: ≈ 1.9σ of remaining vol → P(stays) ≈ 98%
-    (180, 0.15, 0.25),
-    // 240–180s left: ≈ 2.6σ of remaining vol → P(stays) ≈ 99.5%
-    (240, 0.20, 0.20),
+];
+
+/// Early tiers (T-240s to T-45s): dollar-based — race PM before it reprices.
+/// (max_secs_remaining, min_dollar_move, allocation_fraction).
+/// The dollar move is |current_btc - open_btc|, computed from live Binance data.
+/// Evaluated in order; first match wins.
+pub const EARLY_TIERS: [(u64, f64, f64); 3] = [
+    // 120–45s left: $100 BTC move needed
+    (120, 100.0, 0.30),
+    // 180–120s left: $150 BTC move needed
+    (180, 150.0, 0.25),
+    // 240–180s left: $200 BTC move needed
+    (240, 200.0, 0.20),
 ];
 
 /// Never pay more than this for an outcome share.

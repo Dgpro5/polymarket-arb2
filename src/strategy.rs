@@ -1,7 +1,9 @@
 // Strategy — bet timing logic for BTCUSD 5-min UP/DOWN markets.
 //
-// Evaluates whether to place a bet in the final 45–15 seconds of each window,
-// based on BTC price change from window open and dynamic confidence thresholds.
+// Two regimes:
+//  EARLY (T-240s to T-45s): triggers on big dollar moves ($100/$150/$200)
+//       detected on Binance before Polymarket reprices.
+//  LATE  (T-45s to T-8s): triggers on smaller percentage moves close to expiry.
 
 use anyhow::Result;
 use reqwest::Client;
@@ -31,7 +33,7 @@ pub struct BetDecision {
 
 // ── Core evaluation ─────────────────────────────────────────────────────────
 
-/// Called every second during the last 45s of a window.
+/// Called every second during the betting window.
 /// Returns `Some(BetDecision)` if conditions are met, `None` otherwise.
 pub async fn evaluate_bet(
     btc_state: &Arc<Mutex<BtcPriceState>>,
@@ -45,10 +47,11 @@ pub async fn evaluate_bet(
     }
 
     // Read BTC price state
-    let (pct_change, latest_ts) = {
+    let (pct_change, latest_ts, btc_open, btc_current) = {
         let btc = btc_state.lock().await;
         let pct = btc.pct_change()?;
-        (pct, btc.latest_ts)
+        let open = btc.window_open_price?;
+        (pct, btc.latest_ts, open, btc.latest_price)
     };
 
     // Guard: stale price data
@@ -63,25 +66,32 @@ pub async fn evaluate_bet(
     }
 
     let abs_pct = pct_change.abs();
+    let dollar_move = (btc_current - btc_open).abs();
 
     // Guard: flat market
     if abs_pct < FLAT_CUTOFF_PCT {
         return None; // silent skip — flat markets are the common case
     }
 
-    // Find matching tier
-    let (min_pct, alloc_frac) = match find_tier(secs_remaining) {
-        Some((thresh, frac)) => (thresh, frac),
-        None => return None,
+    // Find matching tier — early tiers use dollar thresholds, late tiers use %
+    let alloc_frac = match find_tier(secs_remaining, abs_pct, dollar_move) {
+        Some(frac) => frac,
+        None => {
+            // Log skip for early tiers (dollar-based) vs late tiers (pct-based)
+            if secs_remaining > 45 {
+                eprintln!(
+                    "  T-{}s | BTC: {:.4}% (${:.0}) | need bigger move | SKIP",
+                    secs_remaining, pct_change, dollar_move
+                );
+            } else {
+                eprintln!(
+                    "  T-{}s | BTC: {:.4}% | need bigger % | SKIP",
+                    secs_remaining, pct_change
+                );
+            }
+            return None;
+        }
     };
-
-    if abs_pct < min_pct {
-        eprintln!(
-            "  T-{}s | BTC: {:.4}% | need {:.4}% | SKIP",
-            secs_remaining, pct_change, min_pct
-        );
-        return None;
-    }
 
     // Direction: positive pct_change → BTC going UP
     let direction = if pct_change > 0.0 { "UP" } else { "DOWN" };
@@ -168,9 +178,10 @@ pub async fn evaluate_bet(
     let size_usd = PER_WINDOW_MAX_USD * alloc_frac;
 
     eprintln!(
-        "  T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
+        "  T-{}s | BTC: {:.4}% (${:.0}) {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
         secs_remaining,
         pct_change,
+        dollar_move,
         direction,
         confidence * 100.0,
         ask_price * 100.0,
@@ -338,12 +349,21 @@ pub async fn run_strategy_loop(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Find the tier for the given seconds remaining.
-/// Returns (min_pct_threshold, allocation_fraction) or None.
-fn find_tier(secs_remaining: u64) -> Option<(f64, f64)> {
-    for &(max_secs, min_pct, alloc) in &TIERS {
+/// Find the matching tier for the given seconds remaining.
+/// Late tiers (≤45s) check percentage thresholds.
+/// Early tiers (>45s) check dollar move thresholds.
+/// Returns allocation_fraction if a tier matches, or None.
+fn find_tier(secs_remaining: u64, abs_pct: f64, dollar_move: f64) -> Option<f64> {
+    // First try late tiers (percentage-based)
+    for &(max_secs, min_pct, alloc) in &LATE_TIERS {
         if secs_remaining <= max_secs {
-            return Some((min_pct, alloc));
+            return if abs_pct >= min_pct { Some(alloc) } else { None };
+        }
+    }
+    // Then try early tiers (dollar-based)
+    for &(max_secs, min_dollars, alloc) in &EARLY_TIERS {
+        if secs_remaining <= max_secs {
+            return if dollar_move >= min_dollars { Some(alloc) } else { None };
         }
     }
     None
