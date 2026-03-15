@@ -11,12 +11,8 @@ use crate::consts::{DISCORD_WEBHOOK_URL, ERROR_DISCORD_WEBHOOK_URL};
 // ── Public API ──────────────────────────────────────────────────────────────
 
 /// Send a startup notification to the main Discord channel.
-pub async fn send_startup(client: &Client, wallet_address: &str, balance_usdc: f64) {
-    let msg = format!(
-        "**Bot Started**\nWallet: `{}`\nBalance: **${:.4}** USDC\nStrategy: BET window T-45s → T-15s | Budget: $2/window",
-        wallet_address, balance_usdc
-    );
-    send_main(client, &msg).await;
+pub async fn send_startup(client: &Client) {
+    send_main(client, "**Bot Started**").await;
 }
 
 /// Send a successful bet notification to the main Discord channel.
