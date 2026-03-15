@@ -7,7 +7,7 @@ Polymarket BTC/USD 5-minute UP/DOWN predictive trading bot on Polygon. Streams r
 1. BTC trades on Binance in real-time (sub-second updates via `btcusdt@trade` WebSocket stream)
 2. Each 5-minute window, a new `btc-updown-5m-{timestamp}` market is created on Polymarket with UP and DOWN outcomes
 3. The bot tracks BTC's percent change from the window-open price
-4. In the final 45-15 seconds of each window, if BTC has moved significantly and Polymarket hasn't priced it in yet, the bot buys the corresponding outcome (UP or DOWN)
+4. Two strategies evaluate each tick (Impulse + Momentum). If BTC has moved significantly, the first strategy to fire places a directional bet (UP or DOWN)
 5. After windows close and resolve, positions are automatically redeemed for USDC
 
 ## Project Structure
@@ -96,10 +96,13 @@ Runs forever in a background task. On error, logs and reconnects after 3 seconds
 
 ## Strategy Evaluation (`strategy.rs`)
 
+The bot runs **two independent strategies** per tick. The first one to fire wins (max 1 bet per window). Every log line and Discord alert includes `[Impulse]` or `[Momentum]` to identify which strategy triggered.
+
 ### `BetDecision` (returned when all checks pass)
 
 | Field | Type | Description |
 |-------|------|-------------|
+| `strategy` | `String` | `"Impulse"` or `"Momentum"` — which strategy triggered |
 | `direction` | `String` | `"UP"` or `"DOWN"` |
 | `token_id` | `String` | Polymarket CLOB token ID for the chosen outcome |
 | `size_usd` | `f64` | USDC amount to bet (based on tier allocation) |
@@ -107,87 +110,60 @@ Runs forever in a background task. On error, logs and reconnects after 3 seconds
 | `confidence_pct` | `f64` | Estimated probability the outcome wins (0-100) |
 | `btc_pct_change` | `f64` | BTC percent change from window open |
 
+### Shared Checks (both strategies)
+
+**Price staleness**: If BTC price is older than 20s, skip.
+**Flat market filter**: If `|pct_change| < 0.015%`, skip silently.
+**Confidence**: `P(BTC stays on same side of price-to-beat)` via normal CDF on remaining volatility.
+
+### Strategy 1 — "Impulse" (T-240s to T-8s)
+
+The original latency-arb strategy. Races Polymarket before its orderbook reprices.
+
+**Early window (T-240s to T-45s)**:
+- Requires $60 minimum BTC dollar move
+- Tiered confidence gate (earlier = stricter):
+  - 120–45s left: 70% confidence, 30% alloc
+  - 180–120s left: 75% confidence, 25% alloc
+  - 240–180s left: 80% confidence, 20% alloc
+
+**Late window (T-45s to T-8s)**:
+- Percentage-based tiers (small confirmed moves suffice):
+  - 25–8s left: 0.02% move, 80% alloc
+  - 36–25s left: 0.03% move, 60% alloc
+  - 45–36s left: 0.05% move, 40% alloc
+
+**Checks**: PM drift (skip if Polymarket already moved >10c), edge ≥ 3%.
+
+### Strategy 2 — "Momentum" (T-240s to T-60s)
+
+Catches big BTC moves even if Polymarket has started repricing. More lenient to ensure ~1 trade per window.
+
+- Requires $65 minimum BTC dollar move
+- Tiered confidence gate (more lenient than Impulse):
+  - 120–60s left: 65% confidence, 30% alloc
+  - 180–120s left: 70% confidence, 25% alloc
+  - 240–180s left: 75% confidence, 20% alloc
+
+**Checks**: edge ≥ 2% only. **No PM drift check** — if there's a big price move, we want it regardless.
+
 ### `evaluate_bet(btc_state, market_state, secs_remaining, client)`
 
-Called every 1 second during the betting window. Returns `Some(BetDecision)` if all checks pass, `None` otherwise.
-
-**Check 1 — Time window guard**:
-- Only evaluates when `BET_WINDOW_END_SECS (15) <= secs_remaining <= BET_WINDOW_START_SECS (45)`
-- Outside this range, returns `None` immediately
-
-**Check 2 — BTC percent change**:
-- Reads `btc_state.pct_change()`. If `None` (no window-open price yet), returns `None`
-
-**Check 3 — Price staleness**:
-- If `now_ms() - latest_ts > MAX_PRICE_STALENESS_MS (20,000ms)`, skips with log
-- Protects against acting on old price data during WS reconnects
-
-**Check 4 — Flat market filter**:
-- If `|pct_change| < FLAT_CUTOFF_PCT (0.03%)`, returns `None` silently
-- Most windows are flat; this avoids log spam
-
-**Check 5 — Tiered threshold matching** (`find_tier()`):
-- Looks up the tier for current `secs_remaining` in `TIERS`:
-  - **25-15s left**: BTC move must be >= 0.04%, allocate 80% of budget ($1.60)
-  - **36-25s left**: BTC move must be >= 0.06%, allocate 60% of budget ($1.20)
-  - **45-36s left**: BTC move must be >= 0.08%, allocate 40% of budget ($0.80)
-- If `|pct_change| < min_pct` for the tier, skips with log
-
-**Check 6 — Direction determination**:
-- `pct_change > 0` → direction = `"UP"`, `pct_change < 0` → direction = `"DOWN"`
-- Looks up the `token_id` from `MarketState.asset_to_outcome`
-
-**Check 7 — Polymarket pre-move check**:
-- Compares current mid-price to the window-open mid-price (`open_mid_prices`)
-- If `current_mid - open_mid > MAX_PM_DRIFT (0.10 = 10c)`, skips with log
-- This ensures Polymarket hasn't already priced in the BTC move — we only bet when the market is still showing the "old" price
-
-**Check 8 — Ask price cap**:
-- If `ask_price > MAX_BUY_PRICE (0.92)`, skips
-- Never pays more than 92c for an outcome share
-
-**Check 9 — Confidence estimation**:
-- Models remaining BTC volatility as `sigma = 0.10 / sqrt(300) * sqrt(secs_remaining)`
-- Computes z-score: `z = |pct_change| / sigma`
-- Estimates probability via `approx_normal_cdf(z)` (Abramowitz & Stegun formula 26.2.17, max error ~7.5e-8)
-
-**Check 10 — Edge after fees**:
-- `net_edge = confidence - ask_price - fee_pct`
-- `fee_pct = fee_bps / 10000` (live fee rate polled every second)
-- If `net_edge < MIN_EDGE_PCT (0.03 = 3%)`, skips with full log
-
-**Check 11 — Order book depth**:
-- Fetches order book via REST: `GET /book?token_id={token_id}`
-- Sums top 5 ask levels via `calculate_total_ask_size()`
-- If total ask depth < `MIN_ASK_DEPTH_USD ($50)`, skips
-- Ensures sufficient liquidity for the FAK order to fill
+Called every 1 second. Computes shared state (BTC change, confidence), then tries Strategy 1, then Strategy 2. Returns first signal.
 
 ### `execute_bet(client, wallet, decision, fee_bps)`
 - Computes `size = max(floor(size_usd), 1)` (minimum $1)
 - Sets `salt = now_ms()`, `expiration = now + 300s`
 - Calls `build_order_request()` with order type `"FAK"` (fill-and-kill)
 - Calls `place_single_order()` to submit
-- On success: logs fill details, returns order ID
+- On success: logs `[Strategy] ORDER FILLED`, returns order ID
 - On failure: returns error with rejection details
 
 ### `run_strategy_loop(btc_state, market_state, wallet, client, end_ts, window_slug)`
-Spawned as a tokio task per window. Ticks every 1 second.
-
-1. Computes `secs_remaining = end_ts - now`
-2. If `secs_remaining == 0` → breaks (window over)
-3. If `secs_remaining > BET_WINDOW_START_SECS (45)` → continues (too early)
-4. If `bet_placed == true` → continues (only one bet per window)
-5. If `secs_remaining < BET_WINDOW_END_SECS (15)` → logs final BTC state, breaks
-6. Calls `evaluate_bet()`:
-   - On `Some(decision)`: calls `execute_bet()`, sends Discord alert (success or error), sets `bet_placed = true`
-   - On error: sends Discord error alert, sets `bet_placed = true` (no retry to prevent double-betting)
-7. On loop exit: logs window close price and whether a bet was placed
-
-### `find_tier(secs_remaining)`
-Iterates `TIERS` array. Returns first match `(min_pct_threshold, allocation_fraction)` where `secs_remaining <= max_secs`.
+Spawned as a tokio task per window. Ticks every 1 second. Max 1 bet per window.
 
 ### `approx_normal_cdf(z)`
-Standard normal CDF approximation using Abramowitz & Stegun formula 26.2.17. Handles negative z via symmetry: `CDF(-z) = 1 - CDF(z)`.
+Standard normal CDF approximation using Abramowitz & Stegun formula 26.2.17. Handles negative z via symmetry.
 
 ---
 
@@ -534,25 +510,47 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 | `POL_CRITICAL_THRESHOLD` | `5.0` | Alert + halt if POL at or below this |
 | `POL_TO_USDC_SWAP_FRACTION` | `0.80` | Fraction of POL to swap to USDC.e when USDC is insufficient |
 
-### Strategy Parameters
+### Strategy Parameters (shared)
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `BET_WINDOW_START_SECS` | `45` | Start evaluating at T-45s |
-| `BET_WINDOW_END_SECS` | `15` | Stop placing bets at T-15s |
-| `FLAT_CUTOFF_PCT` | `0.03` | Minimum BTC move % to consider |
-| `MAX_BUY_PRICE` | `0.92` | Never pay more than 92c |
-| `MAX_PM_DRIFT` | `0.10` | Max Polymarket drift (10c) before skip |
-| `MIN_EDGE_PCT` | `0.03` | Minimum net edge (3%) after fees |
-| `MIN_ASK_DEPTH_USD` | `50.0` | Minimum ask-side depth in top 5 levels |
+| `BET_WINDOW_START_SECS` | `240` | Start evaluating at T-240s |
+| `BET_WINDOW_END_SECS` | `8` | Stop placing bets at T-8s |
+| `FLAT_CUTOFF_PCT` | `0.015` | Minimum BTC move % to consider |
+| `MAX_PM_DRIFT` | `0.10` | Max PM drift (10c) — Strategy 1 only |
+| `MIN_EDGE_PCT` | `0.03` | Minimum net edge (3%) — Strategy 1 |
 | `MAX_PRICE_STALENESS_MS` | `20,000` | Reject BTC price older than 20s |
 | `PER_WINDOW_MAX_USD` | `2.0` | Max USDC risk per window |
 
-### Tiered Thresholds (`TIERS`)
+### Strategy 1 (Impulse) Tiers
+
+**Early (T-240s to T-45s)** — $60 min dollar move + confidence:
+| Seconds Left | Min Confidence | Budget Allocation |
+|-------------|---------------|-------------------|
+| 120–45s | 70% | 30% ($0.60) |
+| 180–120s | 75% | 25% ($0.50) |
+| 240–180s | 80% | 20% ($0.40) |
+
+**Late (T-45s to T-8s)** — percentage-based:
 | Seconds Left | Min BTC Move | Budget Allocation |
 |-------------|-------------|-------------------|
-| 25-15s | 0.04% | 80% ($1.60) |
-| 36-25s | 0.06% | 60% ($1.20) |
-| 45-36s | 0.08% | 40% ($0.80) |
+| 25–8s | 0.02% | 80% ($1.60) |
+| 36–25s | 0.03% | 60% ($1.20) |
+| 45–36s | 0.05% | 40% ($0.80) |
+
+### Strategy 2 (Momentum) Parameters
+| Constant | Value | Description |
+|----------|-------|-------------|
+| `S2_WINDOW_START_SECS` | `240` | Operates from T-240s |
+| `S2_WINDOW_END_SECS` | `60` | Stops at T-60s |
+| `S2_MIN_DOLLAR_MOVE` | `$65` | Higher dollar floor |
+| `S2_MIN_EDGE_PCT` | `0.02` | More lenient edge (2%) |
+
+### Strategy 2 (Momentum) Tiers
+| Seconds Left | Min Confidence | Budget Allocation |
+|-------------|---------------|-------------------|
+| 120–60s | 65% | 30% ($0.60) |
+| 180–120s | 70% | 25% ($0.50) |
+| 240–180s | 75% | 20% ($0.40) |
 
 ---
 
@@ -603,19 +601,23 @@ Main Loop (per 5-min window)
   +--> Spawn strategy evaluation (every 1s)
   +--> Connect Polymarket WS (streams UP/DOWN prices)
   |
-  |   Strategy Loop (T-45s to T-15s):
+  |   Strategy Loop (T-240s to T-8s, every 1s):
   |     |
-  |     +--> Check BTC % change from window open
+  |     +--> Read BTC price, compute % change, dollar move
   |     +--> Check price staleness (<20s)
-  |     +--> Check flat market filter (>0.03%)
-  |     +--> Match tier threshold (0.04-0.08%)
-  |     +--> Check Polymarket pre-move (<10c drift)
-  |     +--> Check ask price (<92c)
-  |     +--> Estimate confidence (normal CDF)
-  |     +--> Check edge after fees (>3%)
-  |     +--> Check order book depth (>$50)
-  |     +--> Place FAK order (EIP-712 signed)
-  |     +--> Send Discord alert
+  |     +--> Check flat market filter (>0.015%)
+  |     +--> Compute confidence (normal CDF on remaining vol)
+  |     |
+  |     +--> Try Strategy 1 "Impulse" (T-240s to T-8s):
+  |     |      +--> Early: $60 floor + tiered confidence (70-80%) + PM drift + edge≥3%
+  |     |      +--> Late:  %-based tiers + PM drift + edge≥3%
+  |     |
+  |     +--> Try Strategy 2 "Momentum" (T-240s to T-60s):
+  |     |      +--> $65 floor + tiered confidence (65-75%) + edge≥2%
+  |     |      +--> No PM drift check
+  |     |
+  |     +--> First signal wins → Place FAK order (EIP-712 signed)
+  |     +--> Log [Impulse] or [Momentum] + Send Discord alert
   |     +--> Set bet_placed = true (max 1 per window)
   |
   +--> Window closes
