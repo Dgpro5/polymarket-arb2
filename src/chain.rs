@@ -394,6 +394,12 @@ async fn openocean_swap(
         .as_u64()
         .unwrap_or(300_000);
 
+    // ERC-20 tokens need approval for the OpenOcean router before swapping.
+    if token_in != NATIVE_TOKEN {
+        ensure_allowance(client, wallet, to_addr).await
+            .context("OpenOcean: approve token for router")?;
+    }
+
     let value_wei = if value_str.starts_with("0x") {
         u128::from_str_radix(value_str.trim_start_matches("0x"), 16).unwrap_or(0)
     } else {
