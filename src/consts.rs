@@ -50,13 +50,17 @@ pub const BET_WINDOW_END_SECS: u64 = 8;
 /// BTC 5-min noise floor is ~0.01%, so 0.015% filters jitter.
 pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 
+/// BTC annualized volatility estimate (60%). Used to compute the 5-min σ
+/// dynamically:  σ_5min = BTC_ANNUAL_VOL / √(525_600 / 5) ≈ 0.185%.
+/// This drives the confidence (normal CDF) calculation in strategy.rs.
+pub const BTC_ANNUAL_VOL: f64 = 0.60;
 /// Tiered thresholds: (max_secs_remaining, min_pct_change, allocation_fraction).
 /// Evaluated in order; first match wins.
 ///
 /// Two regimes:
 ///  1. EARLY (240–45s): big BTC moves — race PM before orderbook reprices.
-///     Based on BTC 5-min σ ≈ $85 at $103k (60% annual vol).
-///     At T-240s a $200 move is 2.6σ of remaining vol → P(stays) ≈ 99.5%.
+///     Thresholds in %, so they work at any BTC price.
+///     At T-240s, 0.20% is ≈ 2.6σ of remaining vol → P(stays) ≈ 99.5%.
 ///  2. LATE  (45–8s):  smaller moves suffice because less time to reverse.
 ///     PM drift check already filters priced-in moves.
 pub const TIERS: [(u64, f64, f64); 6] = [
@@ -68,11 +72,11 @@ pub const TIERS: [(u64, f64, f64); 6] = [
     // 45–36s left
     (45, 0.05, 0.40),
     // ── Early tiers (big moves, race the PM orderbook) ─────────────────
-    // 120–45s left: ~$100 move at $103k → P(stays) ≈ 97%, alloc 30%
+    // 120–45s left: ≈ 1.3σ of remaining vol → P(stays) ≈ 97%
     (120, 0.10, 0.30),
-    // 180–120s left: ~$150 move at $103k → P(stays) ≈ 98%, alloc 25%
+    // 180–120s left: ≈ 1.9σ of remaining vol → P(stays) ≈ 98%
     (180, 0.15, 0.25),
-    // 240–180s left: ~$200 move at $103k → P(stays) ≈ 99.5%, alloc 20%
+    // 240–180s left: ≈ 2.6σ of remaining vol → P(stays) ≈ 99.5%
     (240, 0.20, 0.20),
 ];
 

@@ -123,7 +123,12 @@ pub async fn evaluate_bet(
     }
 
     // Estimate confidence (simplified normal CDF approximation)
-    let sigma_remaining = 0.10 / (300_f64).sqrt() * (secs_remaining as f64).sqrt();
+    // σ_remaining = annual_vol / √(mins_per_year) × √(secs_remaining / 60)
+    //             = annual_vol / √(525_600) × √(secs_remaining / 60)
+    // which simplifies to: annual_vol × √(secs_remaining) / √(525_600 × 60)
+    let mins_per_year: f64 = 525_600.0;
+    let sigma_remaining =
+        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
     let z = abs_pct / sigma_remaining;
     let confidence = approx_normal_cdf(z);
 
