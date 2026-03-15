@@ -297,6 +297,11 @@ async fn ensure_ctf_token_approval(client: &Client, wallet: &TradingWallet) -> R
 
 // ── CTF redemption ───────────────────────────────────────────────────────────
 
+/// Public wrapper for single condition_id redemption (used by redemptions module).
+pub async fn redeem_single(_client: &Client, private_key: &str, condition_id_hex: &str) -> Result<()> {
+    redeem_positions(private_key, condition_id_hex).await
+}
+
 async fn redeem_positions(private_key: &str, condition_id_hex: &str) -> Result<()> {
     let rpc_url = ankr_rpc()?;
 
