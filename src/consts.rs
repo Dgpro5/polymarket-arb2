@@ -34,6 +34,10 @@ pub const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
 
 pub const POL_LOW_THRESHOLD: f64 = 0.5;
 pub const POL_TOP_UP_USDC: f64 = 10.0;
+/// If POL balance is at or below this, alert and halt — wallet is critically low.
+pub const POL_CRITICAL_THRESHOLD: f64 = 5.0;
+/// Fraction of POL to swap into USDC.e when USDC balance is insufficient.
+pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 
 // ── Strategy: bet timing ────────────────────────────────────────────────────
 

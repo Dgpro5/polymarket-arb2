@@ -29,18 +29,10 @@ async fn main() -> Result<()> {
 
     // ── On-chain approvals ───────────────────────────────────────────────
     chain::ensure_approvals(&client, &wallet).await?;
-    chain::check_and_top_up_pol(&client, &wallet)
-        .await
-        .unwrap_or_else(|e| eprintln!("POL top-up check failed: {e:#}"));
     chain::redeem_prior_windows(&client, &private_key).await;
 
-    let balance = chain::get_balance(&client, &wallet.address)
-        .await
-        .unwrap_or_else(|e| {
-            eprintln!("Could not fetch balance: {e:#}");
-            0.0
-        });
-    eprintln!("Balance: ${:.4}", balance);
+    // ── Preflight: check POL & USDC.e, swap if needed, halt if critical ──
+    chain::preflight_balance_check(&client, &wallet).await?;
 
     // ── Startup alert ───────────────────────────────────────────────────
     alerts::send_startup(&client).await;

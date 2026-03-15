@@ -42,6 +42,15 @@ pub async fn send_tx_error(client: &Client, context: &str, error: &str, details:
     send_error(client, &msg).await;
 }
 
+/// Send a critical low-POL alert to the error Discord channel.
+pub async fn send_low_pol_alert(client: &Client, pol_balance: f64) {
+    let msg = format!(
+        "**CRITICAL: LOW POL BALANCE**\nPOL balance: **{:.4}**\nBot is shutting down — please top up POL manually.",
+        pol_balance
+    );
+    send_error(client, &msg).await;
+}
+
 // ── Internal ────────────────────────────────────────────────────────────────
 
 async fn send_main(client: &Client, content: &str) {
