@@ -18,7 +18,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::consts::{
     ANKR_API_KEY_ENV, CHAIN_ID, CONDITIONAL_TOKENS_ADDRESS, CTF_EXCHANGE_ADDRESS, GAMMA_API,
-    POL_LOW_THRESHOLD, POL_TOP_UP_USDC, SIMPLESWAP_API_KEY_ENV, USDC_E_POLYGON,
+    PER_WINDOW_MAX_USD, POL_CRITICAL_THRESHOLD, POL_LOW_THRESHOLD, POL_TO_USDC_SWAP_FRACTION,
+    POL_TOP_UP_USDC, SIMPLESWAP_API_KEY_ENV, USDC_E_POLYGON,
 };
 use crate::polymarket::TradingWallet;
 
@@ -345,7 +346,7 @@ async fn redeem_positions(private_key: &str, condition_id_hex: &str) -> Result<(
 
 // ── POL balance & top-up ─────────────────────────────────────────────────────
 
-async fn get_pol_balance(client: &Client, address: &Address) -> Result<f64> {
+pub async fn get_pol_balance(client: &Client, address: &Address) -> Result<f64> {
     let rpc_url = ankr_rpc()?;
     let body = json!({
         "jsonrpc": "2.0",
@@ -436,6 +437,153 @@ async fn send_usdc_transfer(
         .map_err(|e| anyhow!("sign transfer: {e}"))?;
     let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
     send_raw_tx(client, &rpc_url, &raw_tx).await
+}
+
+// ── Preflight balance check ──────────────────────────────────────────────
+
+/// Check POL and USDC.e balances on startup.
+/// - POL <= 5  → Discord alert + return Err to halt the bot.
+/// - USDC.e == 0 or < PER_WINDOW_MAX_USD → swap 80% of POL to USDC.e.
+pub async fn preflight_balance_check(client: &Client, wallet: &TradingWallet) -> Result<()> {
+    let pol = get_pol_balance(client, &wallet.address)
+        .await
+        .context("preflight: failed to fetch POL balance")?;
+    eprintln!("POL balance: {:.4}", pol);
+
+    if pol <= POL_CRITICAL_THRESHOLD {
+        crate::alerts::send_low_pol_alert(client, pol).await;
+        return Err(anyhow!(
+            "POL balance ({:.4}) is at or below critical threshold ({:.1}). Halting.",
+            pol,
+            POL_CRITICAL_THRESHOLD
+        ));
+    }
+
+    let usdc = get_balance(client, &wallet.address)
+        .await
+        .context("preflight: failed to fetch USDC.e balance")?;
+    eprintln!("USDC.e balance: ${:.4}", usdc);
+
+    if usdc >= PER_WINDOW_MAX_USD {
+        return Ok(());
+    }
+
+    // Not enough USDC.e — swap 80% of POL to USDC.e
+    eprintln!(
+        "USDC.e too low (${:.4}) — swapping {:.0}% of POL to USDC.e…",
+        usdc,
+        POL_TO_USDC_SWAP_FRACTION * 100.0
+    );
+
+    if env::var(SIMPLESWAP_API_KEY_ENV)
+        .map(|k| k.trim().is_empty())
+        .unwrap_or(true)
+    {
+        return Err(anyhow!(
+            "USDC.e balance insufficient and SIMPLESWAP_API_KEY not set — cannot swap POL."
+        ));
+    }
+
+    let swap_pol = pol * POL_TO_USDC_SWAP_FRACTION;
+    let recipient = format!("{:#x}", wallet.address);
+
+    let exchange = create_simpleswap_pol_to_usdc(client, swap_pol, &recipient)
+        .await
+        .context("preflight: SimpleSwap POL→USDC.e creation failed")?;
+
+    if exchange.address_from.is_empty() {
+        return Err(anyhow!("SimpleSwap returned empty deposit address for POL→USDC.e swap"));
+    }
+
+    eprintln!(
+        "SimpleSwap exchange created (POL→USDC.e): id={}, deposit={}",
+        exchange.public_id, exchange.address_from
+    );
+
+    send_pol_transfer(client, wallet, &exchange.address_from, swap_pol)
+        .await
+        .context("preflight: failed to send POL to SimpleSwap deposit")?;
+
+    eprintln!("Sent {:.4} POL to SimpleSwap. USDC.e will arrive shortly.", swap_pol);
+    Ok(())
+}
+
+async fn create_simpleswap_pol_to_usdc(
+    client: &Client,
+    amount_pol: f64,
+    recipient: &str,
+) -> Result<SimpleSwapExchange> {
+    let api_key = env::var(SIMPLESWAP_API_KEY_ENV)?;
+    let payload = json!({
+        "tickerFrom": "pol", "networkFrom": "polygon",
+        "tickerTo": "usdcpoly", "networkTo": "polygon",
+        "amount": format!("{:.6}", amount_pol),
+        "fixed": false, "reverse": false, "customFee": null,
+        "addressTo": recipient, "extraIdTo": "",
+        "userRefundAddress": recipient, "userRefundExtraId": "", "rateId": ""
+    });
+
+    let data: Value = client
+        .post("https://api.simpleswap.io/v3/exchanges")
+        .header("x-api-key", api_key.trim())
+        .header("Accept", "application/json")
+        .json(&payload)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    let obj = data.get("result").unwrap_or(&data);
+    if let Some(err) = data.get("error").or_else(|| data.get("message")) {
+        return Err(anyhow!("SimpleSwap error: {err}"));
+    }
+
+    Ok(SimpleSwapExchange {
+        public_id: obj["publicId"].as_str().unwrap_or("").into(),
+        address_from: obj["addressFrom"].as_str().unwrap_or("").into(),
+        amount_from: obj["amountFrom"].as_str().unwrap_or("").into(),
+        status: obj["status"].as_str().unwrap_or("").into(),
+    })
+}
+
+/// Send native POL to an address (e.g. SimpleSwap deposit).
+async fn send_pol_transfer(
+    client: &Client,
+    wallet: &TradingWallet,
+    to_address: &str,
+    amount_pol: f64,
+) -> Result<String> {
+    let rpc_url = ankr_rpc()?;
+    let nonce = get_nonce(client, &rpc_url, &wallet.address).await?;
+    let gas_price = get_gas_price(client, &rpc_url).await?;
+
+    // Convert POL to wei (1 POL = 1e18 wei)
+    let wei = (amount_pol * 1e18) as u128;
+
+    use ethers::types::transaction::eip2718::TypedTransaction;
+    let tx = TypedTransaction::Legacy(ethers::types::TransactionRequest {
+        from: Some(wallet.address),
+        to: Some(to_address.parse::<Address>().context("parse deposit address")?.into()),
+        nonce: Some(U256::from(nonce)),
+        gas: Some(U256::from(21_000u64)),
+        gas_price: Some(U256::from(gas_price * 3)),
+        data: None,
+        value: Some(U256::from(wei)),
+        chain_id: Some(U64::from(CHAIN_ID)),
+        ..Default::default()
+    });
+
+    let sig = wallet
+        .wallet
+        .sign_transaction(&tx)
+        .await
+        .map_err(|e| anyhow!("sign POL transfer: {e}"))?;
+    let raw_tx = format!("0x{}", hex::encode(tx.rlp_signed(&sig)));
+
+    let hash = send_raw_tx(client, &rpc_url, &raw_tx).await?;
+    wait_for_receipt(client, &rpc_url, &hash).await?;
+    eprintln!("POL transfer confirmed: {hash}");
+    Ok(hash)
 }
 
 // ── Shared RPC helpers ───────────────────────────────────────────────────────
