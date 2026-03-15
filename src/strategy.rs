@@ -1,9 +1,10 @@
 // Strategy — bet timing logic for BTCUSD 5-min UP/DOWN markets.
 //
 // Two regimes:
-//  EARLY (T-240s to T-45s): triggers on big dollar moves ($100/$150/$200)
-//       detected on Binance before Polymarket reprices.
-//  LATE  (T-45s to T-8s): triggers on smaller percentage moves close to expiry.
+//  EARLY (T-240s to T-45s): $60 minimum BTC move + confidence ≥ 70%.
+//       Confidence = P(BTC stays on same side of price-to-beat given remaining vol).
+//       Designed to race PM before its orderbook reprices.
+//  LATE  (T-45s to T-8s): small percentage-based thresholds close to expiry.
 
 use anyhow::Result;
 use reqwest::Client;
@@ -73,25 +74,45 @@ pub async fn evaluate_bet(
         return None; // silent skip — flat markets are the common case
     }
 
-    // Find matching tier — early tiers use dollar thresholds, late tiers use %
-    let alloc_frac = match find_tier(secs_remaining, abs_pct, dollar_move) {
-        Some(frac) => frac,
-        None => {
-            // Log skip for early tiers (dollar-based) vs late tiers (pct-based)
-            if secs_remaining > 45 {
-                eprintln!(
-                    "  T-{}s | BTC: {:.4}% (${:.0}) | need bigger move | SKIP",
-                    secs_remaining, pct_change, dollar_move
-                );
-            } else {
+    // ── Compute confidence (used by both early and late paths) ──────────
+    // P(BTC stays on same side of price-to-beat) given remaining volatility.
+    let mins_per_year: f64 = 525_600.0;
+    let sigma_remaining =
+        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
+    let z = abs_pct / sigma_remaining;
+    let confidence = approx_normal_cdf(z);
+
+    // ── Tier gate ───────────────────────────────────────────────────────
+    let is_early = secs_remaining > 45;
+    let alloc_frac;
+
+    if is_early {
+        // EARLY window: $60 floor + confidence ≥ 70%
+        if dollar_move < EARLY_MIN_DOLLAR_MOVE {
+            return None; // silent skip — small moves are common
+        }
+        if confidence < EARLY_MIN_CONFIDENCE {
+            eprintln!(
+                "  T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
+                secs_remaining, pct_change, dollar_move,
+                confidence * 100.0, EARLY_MIN_CONFIDENCE * 100.0
+            );
+            return None;
+        }
+        alloc_frac = EARLY_ALLOC_FRAC;
+    } else {
+        // LATE window: percentage-based tiers
+        match find_late_tier(secs_remaining, abs_pct) {
+            Some(frac) => alloc_frac = frac,
+            None => {
                 eprintln!(
                     "  T-{}s | BTC: {:.4}% | need bigger % | SKIP",
                     secs_remaining, pct_change
                 );
+                return None;
             }
-            return None;
         }
-    };
+    }
 
     // Direction: positive pct_change → BTC going UP
     let direction = if pct_change > 0.0 { "UP" } else { "DOWN" };
@@ -131,16 +152,6 @@ pub async fn evaluate_bet(
         );
         return None;
     }
-
-    // Estimate confidence (simplified normal CDF approximation)
-    // σ_remaining = annual_vol / √(mins_per_year) × √(secs_remaining / 60)
-    //             = annual_vol / √(525_600) × √(secs_remaining / 60)
-    // which simplifies to: annual_vol × √(secs_remaining) / √(525_600 × 60)
-    let mins_per_year: f64 = 525_600.0;
-    let sigma_remaining =
-        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
-    let z = abs_pct / sigma_remaining;
-    let confidence = approx_normal_cdf(z);
 
     // Check edge after fees
     let fee_pct = ms.fee_bps as f64 / 10_000.0;
@@ -349,21 +360,12 @@ pub async fn run_strategy_loop(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Find the matching tier for the given seconds remaining.
-/// Late tiers (≤45s) check percentage thresholds.
-/// Early tiers (>45s) check dollar move thresholds.
+/// Find the matching late tier (T-45s to T-8s, percentage-based).
 /// Returns allocation_fraction if a tier matches, or None.
-fn find_tier(secs_remaining: u64, abs_pct: f64, dollar_move: f64) -> Option<f64> {
-    // First try late tiers (percentage-based)
+fn find_late_tier(secs_remaining: u64, abs_pct: f64) -> Option<f64> {
     for &(max_secs, min_pct, alloc) in &LATE_TIERS {
         if secs_remaining <= max_secs {
             return if abs_pct >= min_pct { Some(alloc) } else { None };
-        }
-    }
-    // Then try early tiers (dollar-based)
-    for &(max_secs, min_dollars, alloc) in &EARLY_TIERS {
-        if secs_remaining <= max_secs {
-            return if dollar_move >= min_dollars { Some(alloc) } else { None };
         }
     }
     None

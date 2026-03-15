@@ -67,18 +67,15 @@ pub const LATE_TIERS: [(u64, f64, f64); 3] = [
     (45, 0.05, 0.40),
 ];
 
-/// Early tiers (T-240s to T-45s): dollar-based — race PM before it reprices.
-/// (max_secs_remaining, min_dollar_move, allocation_fraction).
-/// The dollar move is |current_btc - open_btc|, computed from live Binance data.
-/// Evaluated in order; first match wins.
-pub const EARLY_TIERS: [(u64, f64, f64); 3] = [
-    // 120–45s left: $100 BTC move needed
-    (120, 100.0, 0.30),
-    // 180–120s left: $150 BTC move needed
-    (180, 150.0, 0.25),
-    // 240–180s left: $200 BTC move needed
-    (240, 200.0, 0.20),
-];
+/// Early window (T-240s to T-45s): minimum dollar move to even consider betting.
+/// Below this the move is noise. The real gate is the confidence factor (≥ 70%).
+pub const EARLY_MIN_DOLLAR_MOVE: f64 = 60.0;
+/// Minimum confidence (probability BTC stays on the same side of the price to
+/// beat) required for early-window bets. The confidence factor uses both the
+/// price-to-beat and the current Binance price, scaled by remaining volatility.
+pub const EARLY_MIN_CONFIDENCE: f64 = 0.70;
+/// Allocation fraction for early-window bets.
+pub const EARLY_ALLOC_FRAC: f64 = 0.25;
 
 /// Never pay more than this for an outcome share.
 pub const MAX_BUY_PRICE: f64 = 0.92;
