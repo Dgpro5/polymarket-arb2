@@ -1,10 +1,16 @@
 // Strategy — bet timing logic for BTCUSD 5-min UP/DOWN markets.
 //
-// Two regimes:
-//  EARLY (T-240s to T-45s): $60 minimum BTC move + confidence ≥ 70%.
-//       Confidence = P(BTC stays on same side of price-to-beat given remaining vol).
-//       Designed to race PM before its orderbook reprices.
-//  LATE  (T-45s to T-8s): small percentage-based thresholds close to expiry.
+// Two independent strategies evaluate each tick; first signal wins.
+//
+//  STRATEGY 1 — "Impulse" (original):
+//    EARLY (T-240s to T-45s): $60 minimum BTC move + tiered confidence (70-80%).
+//    LATE  (T-45s to T-8s):   percentage-based thresholds close to expiry.
+//    Checks: PM drift, edge.
+//
+//  STRATEGY 2 — "Momentum" (new):
+//    Operates T-240s to T-60s only. $65 minimum BTC move + tiered confidence (65-75%).
+//    Checks: edge only (no PM drift — we want to catch big moves regardless).
+//    More lenient to ensure we hit at least ~1 trade per window.
 
 use anyhow::Result;
 use reqwest::Client;
@@ -16,14 +22,14 @@ use crate::consts::*;
 use crate::binance::BtcPriceState;
 use crate::redemptions;
 use crate::polymarket::{
-    MarketState, TradingWallet, build_order_request, calculate_total_ask_size,
-    get_order_book, now_ms, place_single_order,
+    MarketState, TradingWallet, build_order_request, now_ms, place_single_order,
 };
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct BetDecision {
+    pub strategy: String,    // "Impulse" or "Momentum"
     pub direction: String,   // "UP" or "DOWN"
     pub token_id: String,
     pub size_usd: f64,
@@ -32,21 +38,224 @@ pub struct BetDecision {
     pub btc_pct_change: f64,
 }
 
-// ── Core evaluation ─────────────────────────────────────────────────────────
+// ── Shared helpers ─────────────────────────────────────────────────────────
 
-/// Called every second during the betting window.
-/// Returns `Some(BetDecision)` if conditions are met, `None` otherwise.
-pub async fn evaluate_bet(
-    btc_state: &Arc<Mutex<BtcPriceState>>,
-    market_state: &Arc<Mutex<MarketState>>,
+/// Compute confidence: P(BTC stays on same side of price-to-beat) given remaining vol.
+fn compute_confidence(abs_pct: f64, secs_remaining: u64) -> f64 {
+    let mins_per_year: f64 = 525_600.0;
+    let sigma_remaining =
+        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
+    let z = abs_pct / sigma_remaining;
+    approx_normal_cdf(z)
+}
+
+/// Resolve direction + token_id from percent change.
+fn resolve_direction(pct_change: f64, ms: &MarketState) -> Option<(String, String, f64)> {
+    let direction = if pct_change > 0.0 { "UP" } else { "DOWN" };
+    let token_id = ms
+        .asset_to_outcome
+        .iter()
+        .find(|(_, outcome)| outcome.eq_ignore_ascii_case(direction))
+        .map(|(id, _)| id.clone())?;
+    let ask_price = ms.best_asks.get(&token_id).copied().unwrap_or(1.0);
+    Some((direction.to_string(), token_id, ask_price))
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STRATEGY 1 — "Impulse"
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Strategy 1: Original impulse strategy.
+/// EARLY (T-240s to T-45s): $60 floor + tiered confidence (70-80%) + PM drift + edge.
+/// LATE  (T-45s to T-8s):   percentage-based tiers + PM drift + edge.
+fn evaluate_impulse(
     secs_remaining: u64,
-    client: &Client,
+    pct_change: f64,
+    abs_pct: f64,
+    dollar_move: f64,
+    confidence: f64,
+    ms: &MarketState,
 ) -> Option<BetDecision> {
-    // Guard: only evaluate within our betting window
+    // Guard: only within Strategy 1 window
     if secs_remaining > BET_WINDOW_START_SECS || secs_remaining < BET_WINDOW_END_SECS {
         return None;
     }
 
+    // ── Tier gate ───────────────────────────────────────────────────────
+    let is_early = secs_remaining > 45;
+    let alloc_frac;
+
+    if is_early {
+        // EARLY window: $60 floor + tiered confidence gate
+        if dollar_move < EARLY_MIN_DOLLAR_MOVE {
+            return None;
+        }
+        match find_early_tier(secs_remaining, confidence) {
+            Some(frac) => alloc_frac = frac,
+            None => {
+                let needed = EARLY_TIERS.iter()
+                    .find(|&&(max_s, _, _)| secs_remaining <= max_s)
+                    .map(|&(_, min_c, _)| min_c)
+                    .unwrap_or(0.80);
+                eprintln!(
+                    "  [Impulse] T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
+                    secs_remaining, pct_change, dollar_move,
+                    confidence * 100.0, needed * 100.0
+                );
+                return None;
+            }
+        }
+    } else {
+        // LATE window: percentage-based tiers
+        match find_late_tier(secs_remaining, abs_pct) {
+            Some(frac) => alloc_frac = frac,
+            None => {
+                eprintln!(
+                    "  [Impulse] T-{}s | BTC: {:.4}% | need bigger % | SKIP",
+                    secs_remaining, pct_change
+                );
+                return None;
+            }
+        }
+    }
+
+    // Resolve direction
+    let (direction, token_id, ask_price) = resolve_direction(pct_change, ms)?;
+
+    // PM drift check (Strategy 1 only)
+    if let Some(&open_mid) = ms.open_mid_prices.get(&token_id) {
+        let current_mid = ms.mid_prices.get(&token_id).copied().unwrap_or(open_mid);
+        let drift = current_mid - open_mid;
+        if drift > MAX_PM_DRIFT {
+            eprintln!(
+                "  [Impulse] T-{}s | BTC: {:.4}% {} | PM drift: {:.2}c → {:.2}c (+{:.2}c) | SKIP",
+                secs_remaining, pct_change, direction,
+                open_mid * 100.0, current_mid * 100.0, drift * 100.0
+            );
+            return None;
+        }
+    }
+
+    // Edge check
+    let fee_pct = ms.fee_bps as f64 / 10_000.0;
+    let net_edge = confidence - ask_price - fee_pct;
+    if net_edge < MIN_EDGE_PCT {
+        eprintln!(
+            "  [Impulse] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% < {:.0}% | SKIP",
+            secs_remaining, pct_change, direction,
+            confidence * 100.0, ask_price * 100.0,
+            net_edge * 100.0, MIN_EDGE_PCT * 100.0
+        );
+        return None;
+    }
+
+    let size_usd = PER_WINDOW_MAX_USD * alloc_frac;
+
+    eprintln!(
+        "  [Impulse] T-{}s | BTC: {:.4}% (${:.0}) {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
+        secs_remaining, pct_change, dollar_move, direction,
+        confidence * 100.0, ask_price * 100.0, net_edge * 100.0, size_usd
+    );
+
+    Some(BetDecision {
+        strategy: "Impulse".to_string(),
+        direction,
+        token_id,
+        size_usd,
+        max_price: ask_price,
+        confidence_pct: confidence * 100.0,
+        btc_pct_change: pct_change,
+    })
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// STRATEGY 2 — "Momentum"
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Strategy 2: Momentum strategy.
+/// Operates T-240s to T-60s. $65 floor + tiered confidence (65-75%) + edge.
+/// No PM drift check — we want to catch big moves regardless.
+fn evaluate_momentum(
+    secs_remaining: u64,
+    pct_change: f64,
+    _abs_pct: f64,
+    dollar_move: f64,
+    confidence: f64,
+    ms: &MarketState,
+) -> Option<BetDecision> {
+    // Guard: only within Strategy 2 window
+    if secs_remaining > S2_WINDOW_START_SECS || secs_remaining < S2_WINDOW_END_SECS {
+        return None;
+    }
+
+    // Dollar move floor
+    if dollar_move < S2_MIN_DOLLAR_MOVE {
+        return None;
+    }
+
+    // Tiered confidence gate
+    let alloc_frac = match find_s2_tier(secs_remaining, confidence) {
+        Some(frac) => frac,
+        None => {
+            let needed = S2_TIERS.iter()
+                .find(|&&(max_s, _, _)| secs_remaining <= max_s)
+                .map(|&(_, min_c, _)| min_c)
+                .unwrap_or(0.75);
+            eprintln!(
+                "  [Momentum] T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
+                secs_remaining, pct_change, dollar_move,
+                confidence * 100.0, needed * 100.0
+            );
+            return None;
+        }
+    };
+
+    // Resolve direction
+    let (direction, token_id, ask_price) = resolve_direction(pct_change, ms)?;
+
+    // Edge check (more lenient than Strategy 1)
+    let fee_pct = ms.fee_bps as f64 / 10_000.0;
+    let net_edge = confidence - ask_price - fee_pct;
+    if net_edge < S2_MIN_EDGE_PCT {
+        eprintln!(
+            "  [Momentum] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% < {:.0}% | SKIP",
+            secs_remaining, pct_change, direction,
+            confidence * 100.0, ask_price * 100.0,
+            net_edge * 100.0, S2_MIN_EDGE_PCT * 100.0
+        );
+        return None;
+    }
+
+    let size_usd = PER_WINDOW_MAX_USD * alloc_frac;
+
+    eprintln!(
+        "  [Momentum] T-{}s | BTC: {:.4}% (${:.0}) {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
+        secs_remaining, pct_change, dollar_move, direction,
+        confidence * 100.0, ask_price * 100.0, net_edge * 100.0, size_usd
+    );
+
+    Some(BetDecision {
+        strategy: "Momentum".to_string(),
+        direction,
+        token_id,
+        size_usd,
+        max_price: ask_price,
+        confidence_pct: confidence * 100.0,
+        btc_pct_change: pct_change,
+    })
+}
+
+// ── Core evaluation (runs both strategies) ─────────────────────────────────
+
+/// Called every second during the betting window.
+/// Tries Strategy 1 (Impulse) first, then Strategy 2 (Momentum).
+/// Returns the first signal that fires.
+pub async fn evaluate_bet(
+    btc_state: &Arc<Mutex<BtcPriceState>>,
+    market_state: &Arc<Mutex<MarketState>>,
+    secs_remaining: u64,
+    _client: &Client,
+) -> Option<BetDecision> {
     // Read BTC price state
     let (pct_change, latest_ts, btc_open, btc_current) = {
         let btc = btc_state.lock().await;
@@ -71,165 +280,44 @@ pub async fn evaluate_bet(
 
     // Guard: flat market
     if abs_pct < FLAT_CUTOFF_PCT {
-        return None; // silent skip — flat markets are the common case
+        return None;
     }
 
-    // ── Compute confidence (used by both early and late paths) ──────────
-    // P(BTC stays on same side of price-to-beat) given remaining volatility.
-    let mins_per_year: f64 = 525_600.0;
-    let sigma_remaining =
-        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
-    let z = abs_pct / sigma_remaining;
-    let confidence = approx_normal_cdf(z);
+    // Compute confidence (shared by both strategies)
+    let confidence = compute_confidence(abs_pct, secs_remaining);
 
-    // ── Tier gate ───────────────────────────────────────────────────────
-    let is_early = secs_remaining > 45;
-    let alloc_frac;
-
-    if is_early {
-        // EARLY window: $60 floor + tiered confidence gate
-        if dollar_move < EARLY_MIN_DOLLAR_MOVE {
-            return None; // silent skip — small moves are common
-        }
-        match find_early_tier(secs_remaining, confidence) {
-            Some(frac) => alloc_frac = frac,
-            None => {
-                // Find what confidence was needed for logging
-                let needed = EARLY_TIERS.iter()
-                    .find(|&&(max_s, _, _)| secs_remaining <= max_s)
-                    .map(|&(_, min_c, _)| min_c)
-                    .unwrap_or(0.80);
-                eprintln!(
-                    "  T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
-                    secs_remaining, pct_change, dollar_move,
-                    confidence * 100.0, needed * 100.0
-                );
-                return None;
-            }
-        }
-    } else {
-        // LATE window: percentage-based tiers
-        match find_late_tier(secs_remaining, abs_pct) {
-            Some(frac) => alloc_frac = frac,
-            None => {
-                eprintln!(
-                    "  T-{}s | BTC: {:.4}% | need bigger % | SKIP",
-                    secs_remaining, pct_change
-                );
-                return None;
-            }
-        }
-    }
-
-    // Direction: positive pct_change → BTC going UP
-    let direction = if pct_change > 0.0 { "UP" } else { "DOWN" };
-
-    // Find the token_id for this direction
+    // Lock market state once for both strategies
     let ms = market_state.lock().await;
-    let token_id = ms
-        .asset_to_outcome
-        .iter()
-        .find(|(_, outcome)| outcome.eq_ignore_ascii_case(direction))
-        .map(|(id, _)| id.clone())?;
 
-    // Check if polymarket already priced in the move
-    if let Some(&open_mid) = ms.open_mid_prices.get(&token_id) {
-        let current_mid = ms.mid_prices.get(&token_id).copied().unwrap_or(open_mid);
-        let drift = current_mid - open_mid;
-        if drift > MAX_PM_DRIFT {
-            eprintln!(
-                "  T-{}s | BTC: {:.4}% {} | PM already moved: {:.2}c → {:.2}c (+{:.2}c) | SKIP",
-                secs_remaining, pct_change, direction,
-                open_mid * 100.0, current_mid * 100.0, drift * 100.0
-            );
-            return None;
-        }
+    // Try Strategy 1 first
+    if let Some(decision) = evaluate_impulse(
+        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms,
+    ) {
+        return Some(decision);
     }
 
-    // Check ask price
-    let ask_price = ms.best_asks.get(&token_id).copied().unwrap_or(1.0);
-    if ask_price > MAX_BUY_PRICE {
-        eprintln!(
-            "  T-{}s | BTC: {:.4}% {} | ask {:.2}c > max {:.0}c | SKIP",
-            secs_remaining,
-            pct_change,
-            direction,
-            ask_price * 100.0,
-            MAX_BUY_PRICE * 100.0
-        );
-        return None;
+    // Try Strategy 2
+    if let Some(decision) = evaluate_momentum(
+        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms,
+    ) {
+        return Some(decision);
     }
 
-    // Check edge after fees
-    let fee_pct = ms.fee_bps as f64 / 10_000.0;
-    let net_edge = confidence - ask_price - fee_pct;
-    if net_edge < MIN_EDGE_PCT {
-        eprintln!(
-            "  T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | fee {:.1}% | edge {:.1}% < {:.0}% | SKIP",
-            secs_remaining, pct_change, direction,
-            confidence * 100.0, ask_price * 100.0, fee_pct * 100.0,
-            net_edge * 100.0, MIN_EDGE_PCT * 100.0
-        );
-        return None;
-    }
-
-    drop(ms);
-
-    // Check order book depth
-    match get_order_book(client, &token_id).await {
-        Ok(book) => {
-            let depth = calculate_total_ask_size(&book.asks);
-            if depth < MIN_ASK_DEPTH_USD {
-                eprintln!(
-                    "  T-{}s | BTC: {:.4}% {} | depth ${:.0} < ${:.0} | SKIP",
-                    secs_remaining, pct_change, direction, depth, MIN_ASK_DEPTH_USD
-                );
-                return None;
-            }
-        }
-        Err(e) => {
-            eprintln!("  T-{}s | order book fetch failed: {e:#} | SKIP", secs_remaining);
-            return None;
-        }
-    }
-
-    let size_usd = PER_WINDOW_MAX_USD * alloc_frac;
-
-    eprintln!(
-        "  T-{}s | BTC: {:.4}% (${:.0}) {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
-        secs_remaining,
-        pct_change,
-        dollar_move,
-        direction,
-        confidence * 100.0,
-        ask_price * 100.0,
-        net_edge * 100.0,
-        size_usd
-    );
-
-    Some(BetDecision {
-        direction: direction.to_string(),
-        token_id,
-        size_usd,
-        max_price: ask_price,
-        confidence_pct: confidence * 100.0,
-        btc_pct_change: pct_change,
-    })
+    None
 }
 
 // ── Execution ───────────────────────────────────────────────────────────────
 
 /// Place the bet as a FAK (fill-and-kill) order.
-/// Returns (success, order_id_or_error).
 async fn execute_bet(
     client: &Client,
     wallet: &Arc<TradingWallet>,
     decision: &BetDecision,
     fee_bps: u64,
 ) -> Result<String> {
-    let size = decision.size_usd.floor().max(1.0) as u64; // minimum $1
+    let size = decision.size_usd.floor().max(1.0) as u64;
     let salt = now_ms() as u64;
-    let expiration = (now_ms() / 1000 + 300) as u64; // 5 min from now
+    let expiration = (now_ms() / 1000 + 300) as u64;
 
     let order = build_order_request(
         wallet,
@@ -248,7 +336,8 @@ async fn execute_bet(
 
     if result.success {
         eprintln!(
-            "  ORDER FILLED: {} {} @ {:.2}c | ${} | id: {}",
+            "  [{}] ORDER FILLED: {} {} @ {:.2}c | ${} | id: {}",
+            decision.strategy,
             decision.direction,
             result.taking_amount,
             decision.max_price * 100.0,
@@ -286,12 +375,10 @@ pub async fn run_strategy_loop(
         let now = now_ms() / 1000;
         let secs_remaining = (end_ts - now).max(0) as u64;
 
-        // Stop if window is over
         if secs_remaining == 0 {
             break;
         }
 
-        // Only evaluate within our window
         if secs_remaining > BET_WINDOW_START_SECS {
             continue;
         }
@@ -301,7 +388,6 @@ pub async fn run_strategy_loop(
         }
 
         if secs_remaining < BET_WINDOW_END_SECS {
-            // Past our cutoff, log final BTC state and stop
             let btc = btc_state.lock().await;
             if let Some(pct) = btc.pct_change() {
                 eprintln!(
@@ -316,7 +402,6 @@ pub async fn run_strategy_loop(
             let fee_bps = market_state.lock().await.fee_bps;
             match execute_bet(&client, &wallet, &decision, fee_bps).await {
                 Ok(order_id) => {
-                    // Discord: successful bet
                     alerts::send_bet_success(
                         &client,
                         &decision.direction,
@@ -328,34 +413,34 @@ pub async fn run_strategy_loop(
                     )
                     .await;
 
-                    // Queue for delayed on-chain redemption
                     redemptions::record_pending(&condition_id, &window_slug);
 
+                    eprintln!(
+                        "  [{}] Bet placed successfully for {}",
+                        decision.strategy, window_slug
+                    );
                     bet_placed = true;
                 }
                 Err(e) => {
                     let details = format!(
-                        "Window: {}\nDirection: {}\nPrice: {:.2}c\nSize: ${:.2}\nBTC change: {:.4}%\nConfidence: {:.1}%",
-                        window_slug, decision.direction, decision.max_price * 100.0,
+                        "Strategy: {}\nWindow: {}\nDirection: {}\nPrice: {:.2}c\nSize: ${:.2}\nBTC change: {:.4}%\nConfidence: {:.1}%",
+                        decision.strategy, window_slug, decision.direction, decision.max_price * 100.0,
                         decision.size_usd, decision.btc_pct_change, decision.confidence_pct
                     );
-                    // Discord: failed tx
                     alerts::send_tx_error(
                         &client,
-                        &format!("BET {} on {}", decision.direction, window_slug),
+                        &format!("[{}] BET {} on {}", decision.strategy, decision.direction, window_slug),
                         &format!("{e:#}"),
                         &details,
                     )
                     .await;
-                    eprintln!("  BET ERROR: {e:#}");
-                    // Don't retry — risk of double-betting
+                    eprintln!("  [{}] BET ERROR: {e:#}", decision.strategy);
                     bet_placed = true;
                 }
             }
         }
     }
 
-    // Log window close price
     let btc = btc_state.lock().await;
     if let Some(pct) = btc.pct_change() {
         eprintln!(
@@ -368,7 +453,6 @@ pub async fn run_strategy_loop(
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Find the matching late tier (T-45s to T-8s, percentage-based).
-/// Returns allocation_fraction if a tier matches, or None.
 fn find_late_tier(secs_remaining: u64, abs_pct: f64) -> Option<f64> {
     for &(max_secs, min_pct, alloc) in &LATE_TIERS {
         if secs_remaining <= max_secs {
@@ -378,10 +462,19 @@ fn find_late_tier(secs_remaining: u64, abs_pct: f64) -> Option<f64> {
     None
 }
 
-/// Find the matching early tier (T-240s to T-45s, confidence-based).
-/// Returns allocation_fraction if confidence meets the tier threshold, or None.
+/// Find the matching early tier for Strategy 1 (T-240s to T-45s, confidence-based).
 fn find_early_tier(secs_remaining: u64, confidence: f64) -> Option<f64> {
     for &(max_secs, min_conf, alloc) in &EARLY_TIERS {
+        if secs_remaining <= max_secs {
+            return if confidence >= min_conf { Some(alloc) } else { None };
+        }
+    }
+    None
+}
+
+/// Find the matching tier for Strategy 2 (T-240s to T-60s, confidence-based).
+fn find_s2_tier(secs_remaining: u64, confidence: f64) -> Option<f64> {
+    for &(max_secs, min_conf, alloc) in &S2_TIERS {
         if secs_remaining <= max_secs {
             return if confidence >= min_conf { Some(alloc) } else { None };
         }

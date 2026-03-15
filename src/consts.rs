@@ -30,9 +30,14 @@ pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 pub const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
 // ── POL gas top-up ──────────────────────────────────────────────────────────
 
-pub const POL_LOW_THRESHOLD: f64 = 0.5;
-/// If POL balance is at or below this, alert and halt — wallet is critically low.
-pub const POL_CRITICAL_THRESHOLD: f64 = 5.0;
+/// When POL drops below this, swap USDC.e → POL to top up gas.
+pub const POL_LOW_THRESHOLD: f64 = 5.0;
+/// If POL is at or below this AND no USDC.e available to swap, halt the bot.
+pub const POL_CRITICAL_THRESHOLD: f64 = 0.5;
+/// Target number of POL to acquire per top-up swap.
+pub const POL_TOP_UP_TARGET: f64 = 50.0;
+/// Estimated USDC.e needed to buy ~50 POL (conservative; OpenOcean gives best rate).
+pub const POL_TOP_UP_USDC: f64 = 25.0;
 /// Fraction of POL to swap into USDC.e when USDC balance is insufficient.
 pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 
@@ -83,20 +88,40 @@ pub const EARLY_TIERS: [(u64, f64, f64); 3] = [
     (240, 0.80, 0.20),
 ];
 
-/// Never pay more than this for an outcome share.
-pub const MAX_BUY_PRICE: f64 = 0.92;
 /// Maximum polymarket price drift from window open before we consider the move
 /// already priced in.  If the outcome we want to bet moved more than this from
 /// its opening mid-price, skip — polymarket already reacted.
+/// NOTE: Only used by Strategy 1 (Impulse). Strategy 2 (Momentum) skips this.
 pub const MAX_PM_DRIFT: f64 = 0.10;
 /// Minimum net edge (P_correct - ask - fee) required to bet.
 pub const MIN_EDGE_PCT: f64 = 0.03;
-/// Minimum total ask depth (USD) in top 5 levels to consider betting.
-pub const MIN_ASK_DEPTH_USD: f64 = 50.0;
 /// Maximum age (ms) of BTC price data before we consider it stale.
 pub const MAX_PRICE_STALENESS_MS: i64 = 20_000;
 /// Maximum USDC to risk per 5-minute window.
 pub const PER_WINDOW_MAX_USD: f64 = 2.0;
+
+// ── Strategy 2 (Momentum) ─────────────────────────────────────────────────
+
+/// Strategy 2 operates from T-240s to T-60s.
+pub const S2_WINDOW_START_SECS: u64 = 240;
+pub const S2_WINDOW_END_SECS: u64 = 60;
+
+/// Minimum dollar move for Strategy 2 to consider betting.
+pub const S2_MIN_DOLLAR_MOVE: f64 = 65.0;
+
+/// Strategy 2 tiers: (max_secs_remaining, min_confidence, allocation_fraction).
+/// More lenient than Strategy 1 to ensure we hit trades.
+pub const S2_TIERS: [(u64, f64, f64); 3] = [
+    // 120–60s left: 65% confidence
+    (120, 0.65, 0.30),
+    // 180–120s left: 70% confidence
+    (180, 0.70, 0.25),
+    // 240–180s left: 75% confidence
+    (240, 0.75, 0.20),
+];
+
+/// Minimum net edge for Strategy 2.
+pub const S2_MIN_EDGE_PCT: f64 = 0.02;
 
 // ── Redemption tracking ────────────────────────────────────────────────────
 

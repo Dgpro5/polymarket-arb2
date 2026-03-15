@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::consts::{
     ANKR_API_KEY_ENV, CHAIN_ID, CONDITIONAL_TOKENS_ADDRESS, CTF_EXCHANGE_ADDRESS, GAMMA_API,
     PER_WINDOW_MAX_USD, POL_CRITICAL_THRESHOLD, POL_LOW_THRESHOLD, POL_TO_USDC_SWAP_FRACTION,
-    USDC_E_POLYGON,
+    POL_TOP_UP_TARGET, POL_TOP_UP_USDC, USDC_E_POLYGON,
 };
 use crate::polymarket::TradingWallet;
 
@@ -126,13 +126,18 @@ pub async fn check_and_top_up_pol(client: &Client, wallet: &TradingWallet) -> Re
     }
 
     let usdc = get_balance(client, &wallet.address).await.unwrap_or(0.0);
-    if usdc < 5.0 {
-        eprintln!("WARN: POL low ({pol:.2}) but only ${usdc:.2} USDC.e — skipping top-up");
+    if usdc < 1.0 {
+        eprintln!(
+            "WARN: POL low ({pol:.2}) but only ${usdc:.2} USDC.e — cannot top up",
+        );
         return Ok(());
     }
 
-    let swap_usdc = 10.0_f64.min(usdc * 0.5);
-    eprintln!("POL low ({pol:.2}) — swapping ${swap_usdc:.2} USDC.e → POL via OpenOcean…");
+    // Swap enough USDC.e to get ~50 POL; cap at what we have
+    let swap_usdc = POL_TOP_UP_USDC.min(usdc);
+    eprintln!(
+        "POL low ({pol:.2} < {POL_LOW_THRESHOLD}) — swapping ${swap_usdc:.2} USDC.e → ~{POL_TOP_UP_TARGET:.0} POL via OpenOcean…"
+    );
 
     match openocean_swap(client, wallet, USDC_E_POLYGON, NATIVE_TOKEN, swap_usdc, 6).await {
         Ok(hash) => eprintln!("USDC.e→POL swap confirmed: {hash}"),
@@ -444,33 +449,56 @@ async fn openocean_swap(
 // ── Preflight balance check ──────────────────────────────────────────────
 
 /// Check POL and USDC.e balances on startup.
-/// - POL <= 5  → Discord alert + return Err to halt the bot.
-/// - USDC.e == 0 or < PER_WINDOW_MAX_USD → swap 80% of POL to USDC.e.
+/// - POL < 5 AND USDC.e available → swap USDC.e → POL (~50 POL).
+/// - POL <= 0.5 AND no USDC.e     → Discord alert + halt.
+/// - USDC.e < PER_WINDOW_MAX_USD  → swap 80% of POL → USDC.e.
 pub async fn preflight_balance_check(client: &Client, wallet: &TradingWallet) -> Result<()> {
-    let pol = get_pol_balance(client, &wallet.address)
+    let mut pol = get_pol_balance(client, &wallet.address)
         .await
         .context("preflight: failed to fetch POL balance")?;
     eprintln!("POL balance: {:.4}", pol);
-
-    if pol <= POL_CRITICAL_THRESHOLD {
-        crate::alerts::send_low_pol_alert(client, pol).await;
-        return Err(anyhow!(
-            "POL balance ({:.4}) is at or below critical threshold ({:.1}). Halting.",
-            pol,
-            POL_CRITICAL_THRESHOLD
-        ));
-    }
 
     let usdc = get_balance(client, &wallet.address)
         .await
         .context("preflight: failed to fetch USDC.e balance")?;
     eprintln!("USDC.e balance: ${:.4}", usdc);
 
+    // ── POL top-up: if POL < 5, try to swap USDC.e → POL first ─────────
+    if pol < POL_LOW_THRESHOLD {
+        if usdc >= 1.0 {
+            let swap_usdc = POL_TOP_UP_USDC.min(usdc);
+            eprintln!(
+                "POL low ({pol:.2} < {POL_LOW_THRESHOLD}) — swapping ${swap_usdc:.2} USDC.e → ~{POL_TOP_UP_TARGET:.0} POL via OpenOcean…"
+            );
+            match openocean_swap(client, wallet, USDC_E_POLYGON, NATIVE_TOKEN, swap_usdc, 6).await {
+                Ok(hash) => {
+                    eprintln!("USDC.e→POL swap confirmed: {hash}");
+                    // Re-read POL balance after swap
+                    pol = get_pol_balance(client, &wallet.address).await.unwrap_or(pol);
+                    eprintln!("POL balance after top-up: {pol:.4}");
+                }
+                Err(e) => eprintln!("WARN: USDC.e→POL swap failed: {e:#}"),
+            }
+        }
+
+        // After swap attempt, if POL is still critically low, halt
+        if pol <= POL_CRITICAL_THRESHOLD {
+            crate::alerts::send_low_pol_alert(client, pol).await;
+            return Err(anyhow!(
+                "POL balance ({:.4}) is critically low ({:.1}) and no USDC.e to swap. Halting.",
+                pol,
+                POL_CRITICAL_THRESHOLD
+            ));
+        }
+    }
+
+    // ── USDC.e check: if not enough for trading, swap POL → USDC.e ─────
+    // Re-read USDC.e in case we just swapped some to POL
+    let usdc = get_balance(client, &wallet.address).await.unwrap_or(usdc);
     if usdc >= PER_WINDOW_MAX_USD {
         return Ok(());
     }
 
-    // Not enough USDC.e — swap 80% of POL to USDC.e via OpenOcean
     let swap_pol = pol * POL_TO_USDC_SWAP_FRACTION;
     eprintln!(
         "USDC.e too low (${:.4}) — swapping {:.2} POL ({:.0}%) to USDC.e via OpenOcean…",
