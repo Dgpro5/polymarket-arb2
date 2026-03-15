@@ -30,9 +30,14 @@ pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 pub const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
 // ── POL gas top-up ──────────────────────────────────────────────────────────
 
-pub const POL_LOW_THRESHOLD: f64 = 0.5;
-/// If POL balance is at or below this, alert and halt — wallet is critically low.
-pub const POL_CRITICAL_THRESHOLD: f64 = 5.0;
+/// When POL drops below this, swap USDC.e → POL to top up gas.
+pub const POL_LOW_THRESHOLD: f64 = 5.0;
+/// If POL is at or below this AND no USDC.e available to swap, halt the bot.
+pub const POL_CRITICAL_THRESHOLD: f64 = 0.5;
+/// Target number of POL to acquire per top-up swap.
+pub const POL_TOP_UP_TARGET: f64 = 50.0;
+/// Estimated USDC.e needed to buy ~50 POL (conservative; OpenOcean gives best rate).
+pub const POL_TOP_UP_USDC: f64 = 25.0;
 /// Fraction of POL to swap into USDC.e when USDC balance is insufficient.
 pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 

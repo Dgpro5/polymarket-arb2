@@ -34,8 +34,9 @@ src/
 5. Calls `chain::ensure_approvals()` — checks/sets USDC allowance and ERC-1155 approval on-chain
 6. Calls `chain::redeem_prior_windows()` — redeems positions from last 5 expired windows
 7. Calls `chain::preflight_balance_check()` — checks POL & USDC.e balances:
-   - If POL <= 5: sends Discord alert and **halts the bot**
-   - If USDC.e < `PER_WINDOW_MAX_USD` ($2): swaps 80% of POL to USDC.e via SimpleSwap
+   - If POL < 5 and USDC.e available: swaps $25 USDC.e → ~50 POL via OpenOcean
+   - If POL still <= 0.5 after swap attempt: sends Discord alert and **halts the bot**
+   - If USDC.e < `PER_WINDOW_MAX_USD` ($2): swaps 80% of POL to USDC.e via OpenOcean
 8. Calls `alerts::send_startup()` — sends Discord notification with wallet address and balance
 9. Spawns `binance::run_price_stream()` as a background tokio task
 10. Enters the main 5-minute window loop
@@ -377,16 +378,11 @@ Scans the last 5 resolved 5-minute windows (skips the most recent one):
 
 #### `preflight_balance_check(client, wallet)`
 Runs on startup before the main loop. Ensures the wallet has enough funds to operate:
-1. Fetches POL balance via `get_pol_balance()`
-2. If POL <= `POL_CRITICAL_THRESHOLD (5.0)`: sends `send_low_pol_alert()` to Discord error channel and returns `Err` to halt the bot
-3. Fetches USDC.e balance via `get_balance()`
+1. Fetches POL and USDC.e balances
+2. If POL < 5 and USDC.e >= $1: swaps $25 USDC.e → ~50 POL via OpenOcean (top-up first)
+3. If POL still <= 0.5 after swap attempt: sends Discord alert and **halts the bot**
 4. If USDC.e >= `PER_WINDOW_MAX_USD ($2)`: returns OK (sufficient for trading)
-5. Otherwise swaps 80% of POL to USDC.e:
-   - Creates SimpleSwap exchange (POL Polygon → USDC.e Polygon) via `create_simpleswap_pol_to_usdc()`
-   - Sends native POL to deposit address via `send_pol_transfer()`
-
-#### `create_simpleswap_pol_to_usdc(client, amount_pol, recipient)`
-Creates a SimpleSwap exchange to convert POL to USDC.e on Polygon. Captures raw HTTP response for debugging non-JSON errors.
+5. Otherwise swaps 80% of POL to USDC.e via OpenOcean
 
 #### `send_pol_transfer(client, wallet, to_address, amount_pol)`
 Sends native POL via a legacy transaction (value transfer, no calldata). Gas: 21,000, gas price: 3x current. Waits for on-chain confirmation.
@@ -394,16 +390,14 @@ Sends native POL via a legacy transaction (value transfer, no calldata). Gas: 21
 ### POL Gas Top-Up
 
 #### `check_and_top_up_pol(client, wallet)`
-1. If `SIMPLESWAP_API_KEY` env var is missing/empty, returns OK (disabled)
-2. Calls `get_pol_balance()` via `eth_getBalance`
-3. If POL balance >= `POL_LOW_THRESHOLD (0.5)`, returns OK
-4. Otherwise:
-   - Creates SimpleSwap exchange via `POST https://api.simpleswap.io/v3/exchanges` (USDC.e Polygon → POL Polygon, $10)
-   - Gets deposit address from response
-   - Sends USDC.e transfer to deposit address via `send_usdc_transfer()`
+Called after every window closes. Ensures the wallet has enough POL for gas fees.
 
-#### `send_usdc_transfer(client, wallet, to_address, amount_usdc)`
-Builds and signs `transfer(to, amount)` call on USDC.e. Gas: 80,000, gas price: 3x current.
+1. Fetches POL balance via `eth_getBalance`
+2. If POL >= `POL_LOW_THRESHOLD (5.0)` → returns OK (enough gas)
+3. If POL < 5 and USDC.e >= $1:
+   - Swaps `$25 USDC.e → ~50 POL` via OpenOcean DEX aggregator
+   - Caps swap at available USDC.e balance
+4. If POL < 5 and USDC.e < $1: logs warning, skips (cannot top up)
 
 ### RPC Helpers
 
@@ -505,9 +499,10 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 ### POL Gas Top-Up & Preflight
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `POL_LOW_THRESHOLD` | `0.5` | Trigger USDC→POL top-up below this balance |
-| `POL_TOP_UP_USDC` | `10.0` | USDC to swap for POL |
-| `POL_CRITICAL_THRESHOLD` | `5.0` | Alert + halt if POL at or below this |
+| `POL_LOW_THRESHOLD` | `5.0` | Trigger USDC.e→POL top-up when POL drops below this |
+| `POL_TOP_UP_TARGET` | `50.0` | Target POL to acquire per swap |
+| `POL_TOP_UP_USDC` | `25.0` | USDC.e to spend per top-up (~50 POL) |
+| `POL_CRITICAL_THRESHOLD` | `0.5` | Alert + halt if POL at or below this AND no USDC.e |
 | `POL_TO_USDC_SWAP_FRACTION` | `0.80` | Fraction of POL to swap to USDC.e when USDC is insufficient |
 
 ### Strategy Parameters (shared)
