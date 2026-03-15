@@ -39,7 +39,8 @@ pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 // ── Strategy: bet timing ────────────────────────────────────────────────────
 
 /// Start evaluating bets when this many seconds remain in the window.
-pub const BET_WINDOW_START_SECS: u64 = 45;
+/// Set to 240s (4 min) to catch big early BTC moves before PM reacts.
+pub const BET_WINDOW_START_SECS: u64 = 240;
 /// Stop placing bets below this — execution risk too high.
 pub const BET_WINDOW_END_SECS: u64 = 8;
 
@@ -51,15 +52,28 @@ pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 
 /// Tiered thresholds: (max_secs_remaining, min_pct_change, allocation_fraction).
 /// Evaluated in order; first match wins.
-/// Thresholds are intentionally low — the PM drift check already filters out
-/// moves that Polymarket has priced in. These just need to exceed noise.
-pub const TIERS: [(u64, f64, f64); 3] = [
+///
+/// Two regimes:
+///  1. EARLY (240–45s): big BTC moves — race PM before orderbook reprices.
+///     Based on BTC 5-min σ ≈ $85 at $103k (60% annual vol).
+///     At T-240s a $200 move is 2.6σ of remaining vol → P(stays) ≈ 99.5%.
+///  2. LATE  (45–8s):  smaller moves suffice because less time to reverse.
+///     PM drift check already filters priced-in moves.
+pub const TIERS: [(u64, f64, f64); 6] = [
+    // ── Late tiers (high confidence, small moves) ──────────────────────
     // 25–8s left: close to expiry, even small confirmed moves are predictive
     (25, 0.02, 0.80),
-    // 36–25s left: medium-high confidence
+    // 36–25s left
     (36, 0.03, 0.60),
-    // 45–36s left: need slightly larger move to justify early entry
+    // 45–36s left
     (45, 0.05, 0.40),
+    // ── Early tiers (big moves, race the PM orderbook) ─────────────────
+    // 120–45s left: ~$100 move at $103k → P(stays) ≈ 97%, alloc 30%
+    (120, 0.10, 0.30),
+    // 180–120s left: ~$150 move at $103k → P(stays) ≈ 98%, alloc 25%
+    (180, 0.15, 0.25),
+    // 240–180s left: ~$200 move at $103k → P(stays) ≈ 99.5%, alloc 20%
+    (240, 0.20, 0.20),
 ];
 
 /// Never pay more than this for an outcome share.
