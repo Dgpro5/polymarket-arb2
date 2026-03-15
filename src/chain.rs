@@ -523,15 +523,33 @@ async fn create_simpleswap_pol_to_usdc(
         "userRefundAddress": recipient, "userRefundExtraId": "", "rateId": ""
     });
 
-    let data: Value = client
+    let resp = client
         .post("https://api.simpleswap.io/v3/exchanges")
         .header("x-api-key", api_key.trim())
         .header("Accept", "application/json")
+        .header("Content-Type", "application/json")
         .json(&payload)
         .send()
-        .await?
-        .json()
         .await?;
+
+    let status = resp.status();
+    let raw = resp.text().await?;
+
+    if !status.is_success() {
+        return Err(anyhow!(
+            "SimpleSwap POL→USDC.e returned HTTP {}: {}",
+            status,
+            &raw[..raw.len().min(500)]
+        ));
+    }
+
+    let data: Value = serde_json::from_str(&raw).with_context(|| {
+        format!(
+            "SimpleSwap returned non-JSON (HTTP {}): {}",
+            status,
+            &raw[..raw.len().min(500)]
+        )
+    })?;
 
     let obj = data.get("result").unwrap_or(&data);
     if let Some(err) = data.get("error").or_else(|| data.get("message")) {

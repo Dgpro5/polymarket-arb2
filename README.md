@@ -32,12 +32,13 @@ src/
 3. Calls `encrypt::get_private_key()` — prompts for password (or first-time key + password setup)
 4. Calls `polymarket::setup_wallet()` — parses private key into `LocalWallet`, derives Polymarket API credentials
 5. Calls `chain::ensure_approvals()` — checks/sets USDC allowance and ERC-1155 approval on-chain
-6. Calls `chain::check_and_top_up_pol()` — swaps USDC to POL via SimpleSwap if gas balance < 0.5 POL
-7. Calls `chain::redeem_prior_windows()` — redeems positions from last 5 expired windows
-8. Calls `chain::get_balance()` — fetches USDC.e balance on Polygon
-9. Calls `alerts::send_startup()` — sends Discord notification with wallet address and balance
-10. Spawns `binance::run_price_stream()` as a background tokio task
-11. Enters the main 5-minute window loop
+6. Calls `chain::redeem_prior_windows()` — redeems positions from last 5 expired windows
+7. Calls `chain::preflight_balance_check()` — checks POL & USDC.e balances:
+   - If POL <= 5: sends Discord alert and **halts the bot**
+   - If USDC.e < `PER_WINDOW_MAX_USD` ($2): swaps 80% of POL to USDC.e via SimpleSwap
+8. Calls `alerts::send_startup()` — sends Discord notification with wallet address and balance
+9. Spawns `binance::run_price_stream()` as a background tokio task
+10. Enters the main 5-minute window loop
 
 ### Main Loop (repeats every 5-minute window)
 
@@ -396,6 +397,24 @@ Scans the last 5 resolved 5-minute windows (skips the most recent one):
 5. Sets `index_sets = [1, 2]` (both UP and DOWN positions)
 6. Submits on-chain redemption transaction
 
+### Preflight Balance Check
+
+#### `preflight_balance_check(client, wallet)`
+Runs on startup before the main loop. Ensures the wallet has enough funds to operate:
+1. Fetches POL balance via `get_pol_balance()`
+2. If POL <= `POL_CRITICAL_THRESHOLD (5.0)`: sends `send_low_pol_alert()` to Discord error channel and returns `Err` to halt the bot
+3. Fetches USDC.e balance via `get_balance()`
+4. If USDC.e >= `PER_WINDOW_MAX_USD ($2)`: returns OK (sufficient for trading)
+5. Otherwise swaps 80% of POL to USDC.e:
+   - Creates SimpleSwap exchange (POL Polygon → USDC.e Polygon) via `create_simpleswap_pol_to_usdc()`
+   - Sends native POL to deposit address via `send_pol_transfer()`
+
+#### `create_simpleswap_pol_to_usdc(client, amount_pol, recipient)`
+Creates a SimpleSwap exchange to convert POL to USDC.e on Polygon. Captures raw HTTP response for debugging non-JSON errors.
+
+#### `send_pol_transfer(client, wallet, to_address, amount_pol)`
+Sends native POL via a legacy transaction (value transfer, no calldata). Gas: 21,000, gas price: 3x current. Waits for on-chain confirmation.
+
 ### POL Gas Top-Up
 
 #### `check_and_top_up_pol(client, wallet)`
@@ -467,6 +486,9 @@ BTC move: X.XXXX%
 Order ID: ...
 ```
 
+### `send_low_pol_alert(client, pol_balance)`
+Sends to error webhook when POL balance is critically low (<= 5 POL). Bot halts after this alert.
+
 ### `send_tx_error(client, context, error, details)`
 Sends to error webhook with full error log and trade details in code blocks.
 
@@ -504,11 +526,13 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 | `ANKR_API_KEY_ENV` | `ANKR_API_KEY` | Yes (Polygon RPC) |
 | `SIMPLESWAP_API_KEY_ENV` | `SIMPLESWAP_API_KEY` | No (POL top-up) |
 
-### POL Gas Top-Up
+### POL Gas Top-Up & Preflight
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `POL_LOW_THRESHOLD` | `0.5` | Trigger top-up below this POL balance |
+| `POL_LOW_THRESHOLD` | `0.5` | Trigger USDC→POL top-up below this balance |
 | `POL_TOP_UP_USDC` | `10.0` | USDC to swap for POL |
+| `POL_CRITICAL_THRESHOLD` | `5.0` | Alert + halt if POL at or below this |
+| `POL_TO_USDC_SWAP_FRACTION` | `0.80` | Fraction of POL to swap to USDC.e when USDC is insufficient |
 
 ### Strategy Parameters
 | Constant | Value | Description |
@@ -563,8 +587,10 @@ Startup
   +--> Decrypt private key (Argon2id + AES-256-GCM)
   +--> Setup wallet (LocalWallet + Polymarket API creds)
   +--> Ensure on-chain approvals (USDC + ERC-1155)
-  +--> Check/top-up POL gas
   +--> Redeem positions from prior windows
+  +--> Preflight balance check:
+  |      +--> POL <= 5? → Discord alert + HALT
+  |      +--> USDC.e < $2? → Swap 80% POL → USDC.e (SimpleSwap)
   +--> Send Discord startup alert
   +--> Start Binance BTC price stream (background)
   |
