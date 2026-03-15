@@ -68,14 +68,20 @@ pub const LATE_TIERS: [(u64, f64, f64); 3] = [
 ];
 
 /// Early window (T-240s to T-45s): minimum dollar move to even consider betting.
-/// Below this the move is noise. The real gate is the confidence factor (≥ 70%).
+/// Below this the move is noise. The real gate is the confidence factor.
 pub const EARLY_MIN_DOLLAR_MOVE: f64 = 60.0;
-/// Minimum confidence (probability BTC stays on the same side of the price to
-/// beat) required for early-window bets. The confidence factor uses both the
-/// price-to-beat and the current Binance price, scaled by remaining volatility.
-pub const EARLY_MIN_CONFIDENCE: f64 = 0.70;
-/// Allocation fraction for early-window bets.
-pub const EARLY_ALLOC_FRAC: f64 = 0.25;
+
+/// Early tiers: (max_secs_remaining, min_confidence, allocation_fraction).
+/// Earlier = more time for reversal = need higher confidence.
+/// Evaluated in order; first match wins.
+pub const EARLY_TIERS: [(u64, f64, f64); 3] = [
+    // 120–45s left: 70% confidence
+    (120, 0.70, 0.30),
+    // 180–120s left: 75% confidence
+    (180, 0.75, 0.25),
+    // 240–180s left: 80% confidence
+    (240, 0.80, 0.20),
+];
 
 /// Never pay more than this for an outcome share.
 pub const MAX_BUY_PRICE: f64 = 0.92;

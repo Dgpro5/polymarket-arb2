@@ -87,19 +87,26 @@ pub async fn evaluate_bet(
     let alloc_frac;
 
     if is_early {
-        // EARLY window: $60 floor + confidence ≥ 70%
+        // EARLY window: $60 floor + tiered confidence gate
         if dollar_move < EARLY_MIN_DOLLAR_MOVE {
             return None; // silent skip — small moves are common
         }
-        if confidence < EARLY_MIN_CONFIDENCE {
-            eprintln!(
-                "  T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
-                secs_remaining, pct_change, dollar_move,
-                confidence * 100.0, EARLY_MIN_CONFIDENCE * 100.0
-            );
-            return None;
+        match find_early_tier(secs_remaining, confidence) {
+            Some(frac) => alloc_frac = frac,
+            None => {
+                // Find what confidence was needed for logging
+                let needed = EARLY_TIERS.iter()
+                    .find(|&&(max_s, _, _)| secs_remaining <= max_s)
+                    .map(|&(_, min_c, _)| min_c)
+                    .unwrap_or(0.80);
+                eprintln!(
+                    "  T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
+                    secs_remaining, pct_change, dollar_move,
+                    confidence * 100.0, needed * 100.0
+                );
+                return None;
+            }
         }
-        alloc_frac = EARLY_ALLOC_FRAC;
     } else {
         // LATE window: percentage-based tiers
         match find_late_tier(secs_remaining, abs_pct) {
@@ -366,6 +373,17 @@ fn find_late_tier(secs_remaining: u64, abs_pct: f64) -> Option<f64> {
     for &(max_secs, min_pct, alloc) in &LATE_TIERS {
         if secs_remaining <= max_secs {
             return if abs_pct >= min_pct { Some(alloc) } else { None };
+        }
+    }
+    None
+}
+
+/// Find the matching early tier (T-240s to T-45s, confidence-based).
+/// Returns allocation_fraction if confidence meets the tier threshold, or None.
+fn find_early_tier(secs_remaining: u64, confidence: f64) -> Option<f64> {
+    for &(max_secs, min_conf, alloc) in &EARLY_TIERS {
+        if secs_remaining <= max_secs {
+            return if confidence >= min_conf { Some(alloc) } else { None };
         }
     }
     None
