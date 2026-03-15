@@ -1,7 +1,10 @@
 // Strategy — bet timing logic for BTCUSD 5-min UP/DOWN markets.
 //
-// Evaluates whether to place a bet in the final 45–15 seconds of each window,
-// based on BTC price change from window open and dynamic confidence thresholds.
+// Two regimes:
+//  EARLY (T-240s to T-45s): $60 minimum BTC move + confidence ≥ 70%.
+//       Confidence = P(BTC stays on same side of price-to-beat given remaining vol).
+//       Designed to race PM before its orderbook reprices.
+//  LATE  (T-45s to T-8s): small percentage-based thresholds close to expiry.
 
 use anyhow::Result;
 use reqwest::Client;
@@ -31,7 +34,7 @@ pub struct BetDecision {
 
 // ── Core evaluation ─────────────────────────────────────────────────────────
 
-/// Called every second during the last 45s of a window.
+/// Called every second during the betting window.
 /// Returns `Some(BetDecision)` if conditions are met, `None` otherwise.
 pub async fn evaluate_bet(
     btc_state: &Arc<Mutex<BtcPriceState>>,
@@ -45,10 +48,11 @@ pub async fn evaluate_bet(
     }
 
     // Read BTC price state
-    let (pct_change, latest_ts) = {
+    let (pct_change, latest_ts, btc_open, btc_current) = {
         let btc = btc_state.lock().await;
         let pct = btc.pct_change()?;
-        (pct, btc.latest_ts)
+        let open = btc.window_open_price?;
+        (pct, btc.latest_ts, open, btc.latest_price)
     };
 
     // Guard: stale price data
@@ -63,24 +67,58 @@ pub async fn evaluate_bet(
     }
 
     let abs_pct = pct_change.abs();
+    let dollar_move = (btc_current - btc_open).abs();
 
     // Guard: flat market
     if abs_pct < FLAT_CUTOFF_PCT {
         return None; // silent skip — flat markets are the common case
     }
 
-    // Find matching tier
-    let (min_pct, alloc_frac) = match find_tier(secs_remaining) {
-        Some((thresh, frac)) => (thresh, frac),
-        None => return None,
-    };
+    // ── Compute confidence (used by both early and late paths) ──────────
+    // P(BTC stays on same side of price-to-beat) given remaining volatility.
+    let mins_per_year: f64 = 525_600.0;
+    let sigma_remaining =
+        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
+    let z = abs_pct / sigma_remaining;
+    let confidence = approx_normal_cdf(z);
 
-    if abs_pct < min_pct {
-        eprintln!(
-            "  T-{}s | BTC: {:.4}% | need {:.4}% | SKIP",
-            secs_remaining, pct_change, min_pct
-        );
-        return None;
+    // ── Tier gate ───────────────────────────────────────────────────────
+    let is_early = secs_remaining > 45;
+    let alloc_frac;
+
+    if is_early {
+        // EARLY window: $60 floor + tiered confidence gate
+        if dollar_move < EARLY_MIN_DOLLAR_MOVE {
+            return None; // silent skip — small moves are common
+        }
+        match find_early_tier(secs_remaining, confidence) {
+            Some(frac) => alloc_frac = frac,
+            None => {
+                // Find what confidence was needed for logging
+                let needed = EARLY_TIERS.iter()
+                    .find(|&&(max_s, _, _)| secs_remaining <= max_s)
+                    .map(|&(_, min_c, _)| min_c)
+                    .unwrap_or(0.80);
+                eprintln!(
+                    "  T-{}s | BTC: {:.4}% (${:.0}) | conf {:.1}% < {:.0}% | SKIP",
+                    secs_remaining, pct_change, dollar_move,
+                    confidence * 100.0, needed * 100.0
+                );
+                return None;
+            }
+        }
+    } else {
+        // LATE window: percentage-based tiers
+        match find_late_tier(secs_remaining, abs_pct) {
+            Some(frac) => alloc_frac = frac,
+            None => {
+                eprintln!(
+                    "  T-{}s | BTC: {:.4}% | need bigger % | SKIP",
+                    secs_remaining, pct_change
+                );
+                return None;
+            }
+        }
     }
 
     // Direction: positive pct_change → BTC going UP
@@ -122,11 +160,6 @@ pub async fn evaluate_bet(
         return None;
     }
 
-    // Estimate confidence (simplified normal CDF approximation)
-    let sigma_remaining = 0.10 / (300_f64).sqrt() * (secs_remaining as f64).sqrt();
-    let z = abs_pct / sigma_remaining;
-    let confidence = approx_normal_cdf(z);
-
     // Check edge after fees
     let fee_pct = ms.fee_bps as f64 / 10_000.0;
     let net_edge = confidence - ask_price - fee_pct;
@@ -163,9 +196,10 @@ pub async fn evaluate_bet(
     let size_usd = PER_WINDOW_MAX_USD * alloc_frac;
 
     eprintln!(
-        "  T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
+        "  T-{}s | BTC: {:.4}% (${:.0}) {} | conf {:.1}% | ask {:.2}c | edge {:.1}% | ${:.2} → BET",
         secs_remaining,
         pct_change,
+        dollar_move,
         direction,
         confidence * 100.0,
         ask_price * 100.0,
@@ -333,12 +367,23 @@ pub async fn run_strategy_loop(
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-/// Find the tier for the given seconds remaining.
-/// Returns (min_pct_threshold, allocation_fraction) or None.
-fn find_tier(secs_remaining: u64) -> Option<(f64, f64)> {
-    for &(max_secs, min_pct, alloc) in &TIERS {
+/// Find the matching late tier (T-45s to T-8s, percentage-based).
+/// Returns allocation_fraction if a tier matches, or None.
+fn find_late_tier(secs_remaining: u64, abs_pct: f64) -> Option<f64> {
+    for &(max_secs, min_pct, alloc) in &LATE_TIERS {
         if secs_remaining <= max_secs {
-            return Some((min_pct, alloc));
+            return if abs_pct >= min_pct { Some(alloc) } else { None };
+        }
+    }
+    None
+}
+
+/// Find the matching early tier (T-240s to T-45s, confidence-based).
+/// Returns allocation_fraction if confidence meets the tier threshold, or None.
+fn find_early_tier(secs_remaining: u64, confidence: f64) -> Option<f64> {
+    for &(max_secs, min_conf, alloc) in &EARLY_TIERS {
+        if secs_remaining <= max_secs {
+            return if confidence >= min_conf { Some(alloc) } else { None };
         }
     }
     None

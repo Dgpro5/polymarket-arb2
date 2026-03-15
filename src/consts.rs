@@ -39,7 +39,8 @@ pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 // ── Strategy: bet timing ────────────────────────────────────────────────────
 
 /// Start evaluating bets when this many seconds remain in the window.
-pub const BET_WINDOW_START_SECS: u64 = 45;
+/// Set to 240s (4 min) to catch big early BTC moves before PM reacts.
+pub const BET_WINDOW_START_SECS: u64 = 240;
 /// Stop placing bets below this — execution risk too high.
 pub const BET_WINDOW_END_SECS: u64 = 8;
 
@@ -49,17 +50,37 @@ pub const BET_WINDOW_END_SECS: u64 = 8;
 /// BTC 5-min noise floor is ~0.01%, so 0.015% filters jitter.
 pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 
-/// Tiered thresholds: (max_secs_remaining, min_pct_change, allocation_fraction).
+/// BTC annualized volatility estimate (60%). Used to compute the 5-min σ
+/// dynamically:  σ_5min = BTC_ANNUAL_VOL / √(525_600 / 5) ≈ 0.185%.
+/// This drives the confidence (normal CDF) calculation in strategy.rs.
+pub const BTC_ANNUAL_VOL: f64 = 0.60;
+
+/// Late tiers (T-45s to T-8s): percentage-based, small moves suffice.
+/// (max_secs_remaining, min_pct_change, allocation_fraction).
 /// Evaluated in order; first match wins.
-/// Thresholds are intentionally low — the PM drift check already filters out
-/// moves that Polymarket has priced in. These just need to exceed noise.
-pub const TIERS: [(u64, f64, f64); 3] = [
+pub const LATE_TIERS: [(u64, f64, f64); 3] = [
     // 25–8s left: close to expiry, even small confirmed moves are predictive
     (25, 0.02, 0.80),
-    // 36–25s left: medium-high confidence
+    // 36–25s left
     (36, 0.03, 0.60),
-    // 45–36s left: need slightly larger move to justify early entry
+    // 45–36s left
     (45, 0.05, 0.40),
+];
+
+/// Early window (T-240s to T-45s): minimum dollar move to even consider betting.
+/// Below this the move is noise. The real gate is the confidence factor.
+pub const EARLY_MIN_DOLLAR_MOVE: f64 = 60.0;
+
+/// Early tiers: (max_secs_remaining, min_confidence, allocation_fraction).
+/// Earlier = more time for reversal = need higher confidence.
+/// Evaluated in order; first match wins.
+pub const EARLY_TIERS: [(u64, f64, f64); 3] = [
+    // 120–45s left: 70% confidence
+    (120, 0.70, 0.30),
+    // 180–120s left: 75% confidence
+    (180, 0.75, 0.25),
+    // 240–180s left: 80% confidence
+    (240, 0.80, 0.20),
 ];
 
 /// Never pay more than this for an outcome share.
