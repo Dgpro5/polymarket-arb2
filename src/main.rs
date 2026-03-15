@@ -4,6 +4,7 @@ mod consts;
 mod encrypt;
 mod binance;
 mod polymarket;
+mod redemptions;
 mod strategy;
 
 use anyhow::{Context, Result};
@@ -40,6 +41,11 @@ async fn main() -> Result<()> {
     // ── BTC price stream (background) ────────────────────────────────────
     let btc_state = binance::BtcPriceState::new_shared();
     tokio::spawn(binance::run_price_stream(Arc::clone(&btc_state)));
+
+    // ── Background redemption loop ────────────────────────────────────────
+    let redeem_client = client.clone();
+    let redeem_key = private_key.clone();
+    tokio::spawn(redemptions::run_redemption_loop(redeem_client, redeem_key));
 
     // ── Main loop: cycle through 5-min windows ──────────────────────────
     let mut backoff = 2u64;
@@ -82,6 +88,7 @@ async fn main() -> Result<()> {
                 let strat_client = client.clone();
                 let strat_end_ts = market.end_ts;
                 let strat_slug = market.slug.clone();
+                let strat_condition_id = market.condition_id.clone();
                 let strat_handle = tokio::spawn(strategy::run_strategy_loop(
                     strat_btc,
                     strat_market,
@@ -89,6 +96,7 @@ async fn main() -> Result<()> {
                     strat_client,
                     strat_end_ts,
                     strat_slug,
+                    strat_condition_id,
                 ));
 
                 // Run Polymarket WS until window ends or socket closes

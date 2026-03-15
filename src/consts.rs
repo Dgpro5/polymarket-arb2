@@ -41,20 +41,25 @@ pub const POL_TO_USDC_SWAP_FRACTION: f64 = 0.80;
 /// Start evaluating bets when this many seconds remain in the window.
 pub const BET_WINDOW_START_SECS: u64 = 45;
 /// Stop placing bets below this — execution risk too high.
-pub const BET_WINDOW_END_SECS: u64 = 15;
+pub const BET_WINDOW_END_SECS: u64 = 8;
 
 /// Below this absolute move, treat market as flat — never bet.
-pub const FLAT_CUTOFF_PCT: f64 = 0.03;
+/// Lowered for latency arb: we trade the delay between Binance real-time
+/// prices and Polymarket's slower orderbook reaction, not the magnitude.
+/// BTC 5-min noise floor is ~0.01%, so 0.015% filters jitter.
+pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 
 /// Tiered thresholds: (max_secs_remaining, min_pct_change, allocation_fraction).
 /// Evaluated in order; first match wins.
+/// Thresholds are intentionally low — the PM drift check already filters out
+/// moves that Polymarket has priced in. These just need to exceed noise.
 pub const TIERS: [(u64, f64, f64); 3] = [
-    // 25–15s left: high confidence, small move sufficient, bet 80%
-    (25, 0.04, 0.80),
-    // 36–25s left: medium-high confidence, bet 60%
-    (36, 0.06, 0.60),
-    // 45–36s left: medium confidence, need larger move, bet 40%
-    (45, 0.08, 0.40),
+    // 25–8s left: close to expiry, even small confirmed moves are predictive
+    (25, 0.02, 0.80),
+    // 36–25s left: medium-high confidence
+    (36, 0.03, 0.60),
+    // 45–36s left: need slightly larger move to justify early entry
+    (45, 0.05, 0.40),
 ];
 
 /// Never pay more than this for an outcome share.
@@ -71,3 +76,13 @@ pub const MIN_ASK_DEPTH_USD: f64 = 50.0;
 pub const MAX_PRICE_STALENESS_MS: i64 = 20_000;
 /// Maximum USDC to risk per 5-minute window.
 pub const PER_WINDOW_MAX_USD: f64 = 2.0;
+
+// ── Redemption tracking ────────────────────────────────────────────────────
+
+/// Path to the pending-redemption ledger (inside DATA_DIR).
+pub const PENDING_REDEMPTIONS_FILE: &str = "data/pending_redemptions.json";
+/// Minimum seconds after bet placement before attempting redemption.
+/// Polymarket needs time to resolve the market and settle on-chain.
+pub const REDEMPTION_DELAY_SECS: u64 = 20 * 60; // 20 minutes
+/// How often (secs) the background redeemer checks the ledger.
+pub const REDEMPTION_POLL_INTERVAL_SECS: u64 = 60;

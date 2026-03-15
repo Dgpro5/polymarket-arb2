@@ -11,6 +11,7 @@ use tokio::sync::Mutex;
 use crate::alerts;
 use crate::consts::*;
 use crate::binance::BtcPriceState;
+use crate::redemptions;
 use crate::polymarket::{
     MarketState, TradingWallet, build_order_request, calculate_total_ask_size,
     get_order_book, now_ms, place_single_order,
@@ -240,6 +241,7 @@ pub async fn run_strategy_loop(
     client: Client,
     end_ts: i64,
     window_slug: String,
+    condition_id: String,
 ) {
     let mut bet_placed = false;
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -291,6 +293,10 @@ pub async fn run_strategy_loop(
                         &window_slug,
                     )
                     .await;
+
+                    // Queue for delayed on-chain redemption
+                    redemptions::record_pending(&condition_id, &window_slug);
+
                     bet_placed = true;
                 }
                 Err(e) => {
