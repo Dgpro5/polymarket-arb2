@@ -43,8 +43,7 @@ async fn main() -> Result<()> {
     eprintln!("Balance: ${:.4}", balance);
 
     // ── Startup alert ───────────────────────────────────────────────────
-    let wallet_addr = format!("{:#x}", wallet.address);
-    alerts::send_startup(&client, &wallet_addr, balance).await;
+    alerts::send_startup(&client).await;
 
     // ── BTC price stream (background) ────────────────────────────────────
     let btc_state = binance::BtcPriceState::new_shared();
