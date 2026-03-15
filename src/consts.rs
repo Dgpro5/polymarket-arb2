@@ -28,12 +28,9 @@ pub const ZERO_ADDRESS: &str = "0x0000000000000000000000000000000000000000";
 // ── Environment variable keys ───────────────────────────────────────────────
 
 pub const ANKR_API_KEY_ENV: &str = "ANKR_API_KEY";
-pub const SIMPLESWAP_API_KEY_ENV: &str = "SIMPLESWAP_API_KEY";
-
 // ── POL gas top-up ──────────────────────────────────────────────────────────
 
 pub const POL_LOW_THRESHOLD: f64 = 0.5;
-pub const POL_TOP_UP_USDC: f64 = 10.0;
 /// If POL balance is at or below this, alert and halt — wallet is critically low.
 pub const POL_CRITICAL_THRESHOLD: f64 = 5.0;
 /// Fraction of POL to swap into USDC.e when USDC balance is insufficient.
