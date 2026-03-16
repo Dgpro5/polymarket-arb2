@@ -160,14 +160,15 @@ fn evaluate_impulse(
         }
     }
 
-    // Edge check
-    let fee_pct = ms.fee_bps as f64 / 10_000.0;
+    // Edge check — Polymarket fee: baseRate × min(price, 1-price)
+    let base_rate = ms.fee_bps as f64 / 10_000.0;
+    let fee_pct = base_rate * ask_price.min(1.0 - ask_price);
     let net_edge = confidence - ask_price - fee_pct;
     if net_edge < MIN_EDGE_PCT {
         eprintln!(
-            "  [Impulse] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% < {:.0}% | SKIP",
+            "  [Impulse] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | fee {:.1}% | edge {:.1}% < {:.0}% | SKIP",
             secs_remaining, pct_change, direction,
-            confidence * 100.0, ask_price * 100.0,
+            confidence * 100.0, ask_price * 100.0, fee_pct * 100.0,
             net_edge * 100.0, MIN_EDGE_PCT * 100.0
         );
         return None;
@@ -238,14 +239,15 @@ fn evaluate_momentum(
     // Resolve direction
     let (direction, token_id, ask_price) = resolve_direction(pct_change, ms)?;
 
-    // Edge check (more lenient than Strategy 1)
-    let fee_pct = ms.fee_bps as f64 / 10_000.0;
+    // Edge check (more lenient than Strategy 1) — Polymarket fee: baseRate × min(price, 1-price)
+    let base_rate = ms.fee_bps as f64 / 10_000.0;
+    let fee_pct = base_rate * ask_price.min(1.0 - ask_price);
     let net_edge = confidence - ask_price - fee_pct;
     if net_edge < S2_MIN_EDGE_PCT {
         eprintln!(
-            "  [Momentum] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | edge {:.1}% < {:.0}% | SKIP",
+            "  [Momentum] T-{}s | BTC: {:.4}% {} | conf {:.1}% | ask {:.2}c | fee {:.1}% | edge {:.1}% < {:.0}% | SKIP",
             secs_remaining, pct_change, direction,
-            confidence * 100.0, ask_price * 100.0,
+            confidence * 100.0, ask_price * 100.0, fee_pct * 100.0,
             net_edge * 100.0, S2_MIN_EDGE_PCT * 100.0
         );
         return None;

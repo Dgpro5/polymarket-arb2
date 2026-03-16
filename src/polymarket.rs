@@ -535,13 +535,13 @@ fn parse_price_change(c: &Value, root: Option<&str>) -> Option<(String, f64)> {
 // ── Fee rate & order book ────────────────────────────────────────────────────
 
 pub async fn get_fee_rate(client: &Client, token_id: &str) -> Result<u64> {
-    let url = format!("{CLOB_API}/markets/fee-rate?token_id={token_id}");
+    let url = format!("{CLOB_API}/fee-rate?token_id={token_id}");
     let raw = client.get(&url).send().await?.text().await?;
     let v: Value = serde_json::from_str(&raw)
         .with_context(|| format!("parse fee rate: {raw}"))?;
-    v.get("base_fee")
+    v.get("fee_rate_bps")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing base_fee: {raw}"))
+        .ok_or_else(|| anyhow!("missing fee_rate_bps: {raw}"))
 }
 
 pub async fn get_order_book(client: &Client, token_id: &str) -> Result<OrderBook> {
