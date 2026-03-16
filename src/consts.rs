@@ -55,10 +55,17 @@ pub const BET_WINDOW_END_SECS: u64 = 8;
 /// BTC 5-min noise floor is ~0.01%, so 0.015% filters jitter.
 pub const FLAT_CUTOFF_PCT: f64 = 0.015;
 
-/// BTC annualized volatility estimate (60%). Used to compute the 5-min σ
-/// dynamically:  σ_5min = BTC_ANNUAL_VOL / √(525_600 / 5) ≈ 0.185%.
-/// This drives the confidence (normal CDF) calculation in strategy.rs.
+/// BTC annualized volatility estimate (60%). Used as fallback when realized
+/// volatility has insufficient data (< 10 minutes of samples).
+/// σ_5min = BTC_ANNUAL_VOL / √(525_600 / 5) ≈ 0.185%.
 pub const BTC_ANNUAL_VOL: f64 = 0.60;
+
+/// Multiplier applied to realized 5-min σ to get minimum dollar move threshold.
+/// min_dollar_move = btc_price × σ_5min × multiplier.
+/// At 60% annual vol with BTC ~$84k: $84k × 0.00185 × 0.39 ≈ $60 (matches old constant).
+pub const VOL_MOVE_MULTIPLIER: f64 = 0.39;
+/// Strategy 2 uses a slightly higher multiplier ($65 equivalent).
+pub const S2_VOL_MOVE_MULTIPLIER: f64 = 0.42;
 
 /// Late tiers (T-45s to T-8s): percentage-based, small moves suffice.
 /// (max_secs_remaining, min_pct_change, allocation_fraction).

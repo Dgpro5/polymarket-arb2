@@ -30,6 +30,9 @@ pub struct MarketInfo {
     pub condition_id: String,
     pub asset_ids: Vec<String>,
     pub outcomes: Vec<String>,
+    /// Chainlink BTC/USD reference price from Polymarket's eventMetadata.
+    /// This is the "price to beat" the market resolves against.
+    pub price_to_beat: Option<f64>,
 }
 
 /// Live Polymarket outcome prices for the current window.
@@ -189,18 +192,33 @@ pub fn compute_current_slug() -> (String, i64) {
 pub async fn discover_active_btc_5m_market(client: &Client) -> Result<MarketInfo> {
     let (slug, end_ts) = compute_current_slug();
 
-    let url = format!("{GAMMA_API}/markets?slug={slug}");
-    let resp = client.get(&url).send().await.context("fetch market by slug")?;
-    let data: Value = resp.json().await.context("parse market response")?;
+    // Use /events endpoint — it includes eventMetadata.priceToBeat (Chainlink reference)
+    let url = format!("{GAMMA_API}/events?slug={slug}");
+    let resp = client.get(&url).send().await.context("fetch event by slug")?;
+    let data: Value = resp.json().await.context("parse event response")?;
 
-    let market = data
+    let event = data
         .as_array()
         .and_then(|arr| arr.first())
-        .ok_or_else(|| anyhow!("Market not found for slug '{slug}'"))?;
+        .ok_or_else(|| anyhow!("Event not found for slug '{slug}'"))?;
+
+    // Extract priceToBeat from event-level metadata
+    let price_to_beat = extract_price_to_beat(event);
+
+    // Get the first market within the event
+    let market = event
+        .get("markets")
+        .and_then(|m| m.as_array())
+        .and_then(|arr| arr.first())
+        .ok_or_else(|| anyhow!("No markets in event '{slug}'"))?;
 
     let mut info = parse_market_info(market)?;
     info.slug = slug;
     info.end_ts = end_ts;
+    // Prefer event-level priceToBeat over market-level (market usually doesn't have it)
+    if price_to_beat.is_some() {
+        info.price_to_beat = price_to_beat;
+    }
     Ok(info)
 }
 
@@ -225,13 +243,85 @@ fn parse_market_info(market: &Value) -> Result<MarketInfo> {
         ));
     }
 
+    // Extract priceToBeat from eventMetadata (Chainlink BTC/USD reference price)
+    let price_to_beat = extract_price_to_beat(market);
+
     Ok(MarketInfo {
         slug: String::new(),
         end_ts: 0,
         condition_id,
         asset_ids,
         outcomes,
+        price_to_beat,
     })
+}
+
+/// Extract the "price to beat" from the Gamma API market response.
+/// Tries eventMetadata.priceToBeat first, then falls back to parsing the description.
+fn extract_price_to_beat(market: &Value) -> Option<f64> {
+    // Try 1: eventMetadata object with priceToBeat field
+    if let Some(meta) = market.get("eventMetadata") {
+        // Could be a nested object
+        if let Some(ptb) = meta.get("priceToBeat") {
+            if let Some(n) = ptb.as_f64() {
+                return Some(n);
+            }
+            if let Some(s) = ptb.as_str() {
+                if let Ok(n) = s.parse::<f64>() {
+                    return Some(n);
+                }
+            }
+        }
+        // Could be a JSON string that needs parsing
+        if let Some(s) = meta.as_str() {
+            if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                if let Some(ptb) = parsed.get("priceToBeat") {
+                    if let Some(n) = ptb.as_f64() {
+                        return Some(n);
+                    }
+                    if let Some(s) = ptb.as_str() {
+                        if let Ok(n) = s.parse::<f64>() {
+                            return Some(n);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Try 2: top-level priceToBeat field
+    if let Some(ptb) = market.get("priceToBeat") {
+        if let Some(n) = ptb.as_f64() {
+            return Some(n);
+        }
+        if let Some(s) = ptb.as_str() {
+            if let Ok(n) = s.parse::<f64>() {
+                return Some(n);
+            }
+        }
+    }
+
+    // Try 3: parse from description text (e.g. "Price to Beat" of $71,698.29)
+    if let Some(desc) = market.get("description").and_then(|v| v.as_str()) {
+        if let Some(price) = parse_price_from_description(desc) {
+            return Some(price);
+        }
+    }
+
+    None
+}
+
+/// Parse a dollar price from description text like:
+/// "Price to Beat" of $71,698.29 or "Price to Beat ($71,698.29)"
+fn parse_price_from_description(desc: &str) -> Option<f64> {
+    // Look for $ followed by digits, commas, and decimal
+    let dollar_idx = desc.find('$')?;
+    let after = &desc[dollar_idx + 1..];
+    let end = after
+        .find(|c: char| !c.is_ascii_digit() && c != ',' && c != '.')
+        .unwrap_or(after.len());
+    let price_str: String = after[..end].chars().filter(|&c| c != ',').collect();
+    price_str.parse::<f64>().ok()
 }
 
 fn parse_string_array(value: Option<&Value>) -> Result<Vec<String>> {
