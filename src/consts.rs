@@ -106,6 +106,8 @@ pub const MIN_EDGE_PCT: f64 = 0.03;
 pub const MAX_PRICE_STALENESS_MS: i64 = 20_000;
 /// Maximum USDC to risk per 5-minute window.
 pub const PER_WINDOW_MAX_USD: f64 = 2.0;
+/// Maximum ask price we'll pay for any position (UP or DOWN).
+pub const MAX_ASK_PRICE: f64 = 0.75;
 
 // ── Strategy 2 (Momentum) ─────────────────────────────────────────────────
 

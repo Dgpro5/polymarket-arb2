@@ -80,7 +80,14 @@ fn resolve_direction(pct_change: f64, ms: &MarketState) -> Option<(String, Strin
         .iter()
         .find(|(_, outcome)| outcome.eq_ignore_ascii_case(direction))
         .map(|(id, _)| id.clone())?;
-    let ask_price = ms.best_asks.get(&token_id).copied().unwrap_or(1.0);
+    let ask_price = ms.best_asks.get(&token_id).copied()?;
+    if ask_price > MAX_ASK_PRICE {
+        eprintln!(
+            "  [{}] ask {:.2}c > {:.0}c cap | SKIP",
+            direction, ask_price * 100.0, MAX_ASK_PRICE * 100.0
+        );
+        return None;
+    }
     Some((direction.to_string(), token_id, ask_price))
 }
 
