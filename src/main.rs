@@ -62,8 +62,18 @@ async fn main() -> Result<()> {
 
                 let state = polymarket::MarketState::new_shared(&market);
 
-                // Reset BTC window-open price for the new window
-                btc_state.lock().await.reset_window();
+                // Reset BTC window-open price for the new window.
+                // Use Polymarket's Chainlink-sourced "price to beat" as the reference.
+                {
+                    let mut btc = btc_state.lock().await;
+                    btc.reset_window();
+                    if let Some(ptb) = market.price_to_beat {
+                        btc.window_open_price = Some(ptb);
+                        eprintln!("Price to beat (Chainlink): ${:.2}", ptb);
+                    } else {
+                        eprintln!("WARN: No priceToBeat from Polymarket — will use first Binance price");
+                    }
+                }
 
                 // Start background fee refresh for this window
                 let fee_state = Arc::clone(&state);

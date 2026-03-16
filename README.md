@@ -44,8 +44,8 @@ src/
 ### Main Loop (repeats every 5-minute window)
 
 Each iteration:
-1. `polymarket::discover_active_btc_5m_market()` — finds current window's market via Gamma API
-2. `btc_state.lock().await.reset_window()` — clears BTC window-open price for fresh tracking
+1. `polymarket::discover_active_btc_5m_market()` — finds current window's event via Gamma API `/events` endpoint, extracting `eventMetadata.priceToBeat` (Chainlink BTC/USD reference price)
+2. Sets `btc_state.window_open_price` to Polymarket's **price to beat** (Chainlink-sourced). Falls back to first Binance price if unavailable
 3. Spawns **fee rate refresh task** — polls `polymarket::get_fee_rate()` every 1 second
 4. Spawns **strategy evaluation task** — runs `strategy::run_strategy_loop()` every 1 second
 5. Runs `polymarket::run_market_ws()` — connects to Polymarket CLOB WebSocket, streams UP/DOWN prices until window ends
@@ -61,7 +61,7 @@ Each iteration:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `window_open_price` | `Option<f64>` | BTC price at start of current 5-min window (set on first update after `reset_window()`) |
+| `window_open_price` | `Option<f64>` | Polymarket's "price to beat" (Chainlink BTC/USD) — set from `eventMetadata.priceToBeat`; falls back to first Binance price |
 | `latest_price` | `f64` | Most recent BTC trade price |
 | `latest_ts` | `i64` | Timestamp (ms) of latest update |
 
@@ -69,7 +69,7 @@ Each iteration:
 Returns `Some(pct)` where `pct = (latest_price - window_open_price) / window_open_price * 100.0`. Positive means BTC going up. Returns `None` if no window open price set yet.
 
 ### `BtcPriceState::reset_window()`
-Clears `window_open_price` to `None`. Called at the start of each new 5-minute window so the next price update becomes the new open price.
+Clears `window_open_price` to `None`. Called at the start of each new 5-minute window. The price is then set to Polymarket's `priceToBeat` from Chainlink; if unavailable, the first Binance trade price is used as fallback.
 
 ### `run_price_stream(state)`
 Runs forever in a background task. On error, logs and reconnects after 3 seconds.
@@ -180,6 +180,7 @@ Standard normal CDF approximation using Abramowitz & Stegun formula 26.2.17. Han
 | `condition_id` | `String` | Hex condition ID for CTF redemption |
 | `asset_ids` | `Vec<String>` | CLOB token IDs for each outcome |
 | `outcomes` | `Vec<String>` | Outcome names (e.g. `["Up", "Down"]`) |
+| `price_to_beat` | `Option<f64>` | Chainlink BTC/USD reference price from `eventMetadata.priceToBeat` |
 
 **`MarketState`** — live price tracking (shared via `Arc<Mutex<...>>`):
 | Field | Type | Description |
@@ -229,10 +230,17 @@ Computes `btc-updown-5m-{start_ts}` where `start_ts = now - (now % 300)`. Return
 
 #### `discover_active_btc_5m_market(client)`
 1. Computes current slug
-2. Queries `GET {GAMMA_API}/markets?slug={slug}`
-3. Parses `conditionId`, `clobTokenIds`, `outcomes` from response
-4. Validates token count matches outcome count
-5. Returns `MarketInfo`
+2. Queries `GET {GAMMA_API}/events?slug={slug}` (events endpoint includes `eventMetadata`)
+3. Extracts `eventMetadata.priceToBeat` — the Chainlink BTC/USD reference price the market resolves against
+4. Parses `conditionId`, `clobTokenIds`, `outcomes` from the first market in the event
+5. Validates token count matches outcome count
+6. Returns `MarketInfo` with `price_to_beat` field set
+
+#### `extract_price_to_beat(market)`
+Extracts the Chainlink "price to beat" from the API response. Tries three sources in order:
+1. `eventMetadata.priceToBeat` (object or JSON string)
+2. Top-level `priceToBeat` field
+3. Regex parse from `description` text (fallback)
 
 #### `parse_market_info(market)` / `parse_string_array(value)`
 JSON parsing helpers. Handles both native JSON arrays and stringified JSON arrays in API responses.
