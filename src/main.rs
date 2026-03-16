@@ -73,6 +73,19 @@ async fn main() -> Result<()> {
                     } else {
                         eprintln!("WARN: No priceToBeat from Polymarket — will use first Binance price");
                     }
+                    // Log realized volatility and dynamic thresholds
+                    if let Some(sigma) = btc.realized_vol_5min() {
+                        let price = if btc.latest_price > 0.0 { btc.latest_price } else { 84000.0 };
+                        eprintln!(
+                            "Realized σ_5min: {:.4}% | min move S1: ${:.0} | S2: ${:.0}",
+                            sigma * 100.0,
+                            price * sigma * consts::VOL_MOVE_MULTIPLIER,
+                            price * sigma * consts::S2_VOL_MOVE_MULTIPLIER,
+                        );
+                    } else {
+                        eprintln!("Realized vol: insufficient data — using fixed thresholds (S1: ${}, S2: ${})",
+                            consts::EARLY_MIN_DOLLAR_MOVE, consts::S2_MIN_DOLLAR_MOVE);
+                    }
                 }
 
                 // Start background fee refresh for this window

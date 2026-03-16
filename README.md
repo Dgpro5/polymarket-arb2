@@ -64,12 +64,28 @@ Each iteration:
 | `window_open_price` | `Option<f64>` | Polymarket's "price to beat" (Chainlink BTC/USD) — set from `eventMetadata.priceToBeat`; falls back to first Binance price |
 | `latest_price` | `f64` | Most recent BTC trade price |
 | `latest_ts` | `i64` | Timestamp (ms) of latest update |
+| `price_samples` | `VecDeque<(i64, f64)>` | Rolling 1-minute price samples for volatility calculation (max 60) |
+| `cached_sigma_5min` | `Option<f64>` | Realized 5-minute volatility as a fraction (e.g. 0.002 = 0.2%) |
 
 ### `BtcPriceState::pct_change()`
 Returns `Some(pct)` where `pct = (latest_price - window_open_price) / window_open_price * 100.0`. Positive means BTC going up. Returns `None` if no window open price set yet.
 
 ### `BtcPriceState::reset_window()`
 Clears `window_open_price` to `None`. Called at the start of each new 5-minute window. The price is then set to Polymarket's `priceToBeat` from Chainlink; if unavailable, the first Binance trade price is used as fallback.
+
+### `BtcPriceState::realized_vol_5min()`
+Returns the **realized 5-minute volatility** computed from rolling 1-minute log returns:
+1. Every 60 seconds, the current Binance price is sampled into a ring buffer (max 60 samples = 1 hour)
+2. Log returns are computed between consecutive samples: `ln(p2/p1)`
+3. Standard deviation of log returns = σ_1min
+4. Scaled to 5 minutes: `σ_5min = σ_1min × √5`
+5. Returns `None` until at least 10 samples are collected (~10 minutes of data)
+
+This drives **dynamic minimum dollar move thresholds**:
+- `min_dollar_move = btc_price × σ_5min × VOL_MOVE_MULTIPLIER`
+- Replaces the old fixed `$60` / `$65` constants
+- Adapts automatically: higher vol → higher threshold, lower vol → lower threshold
+- Clamped to `$10–$500` range as safety bounds
 
 ### `run_price_stream(state)`
 Runs forever in a background task. On error, logs and reconnects after 3 seconds.
@@ -115,14 +131,16 @@ The bot runs **two independent strategies** per tick. The first one to fire wins
 
 **Price staleness**: If BTC price is older than 20s, skip.
 **Flat market filter**: If `|pct_change| < 0.015%`, skip silently.
-**Confidence**: `P(BTC stays on same side of price-to-beat)` via normal CDF on remaining volatility.
+**Confidence**: `P(BTC stays on same side of price-to-beat)` via normal CDF on remaining volatility. Uses realized volatility when available, falls back to `BTC_ANNUAL_VOL` (60%) constant.
+
+**Dynamic minimum dollar move**: Both strategies compute `min_dollar_move = btc_price × realized_σ_5min × multiplier` from rolling 1-minute Binance samples. Falls back to fixed constants ($60/$65) when insufficient data.
 
 ### Strategy 1 — "Impulse" (T-240s to T-8s)
 
 The original latency-arb strategy. Races Polymarket before its orderbook reprices.
 
 **Early window (T-240s to T-45s)**:
-- Requires $60 minimum BTC dollar move
+- Requires dynamic minimum BTC dollar move (was fixed $60, now adapts to volatility)
 - Tiered confidence gate (earlier = stricter):
   - 120–45s left: 70% confidence, 30% alloc
   - 180–120s left: 75% confidence, 25% alloc
@@ -140,7 +158,7 @@ The original latency-arb strategy. Races Polymarket before its orderbook reprice
 
 Catches big BTC moves even if Polymarket has started repricing. More lenient to ensure ~1 trade per window.
 
-- Requires $65 minimum BTC dollar move
+- Requires dynamic minimum BTC dollar move (was fixed $65, now adapts to volatility)
 - Tiered confidence gate (more lenient than Impulse):
   - 120–60s left: 65% confidence, 30% alloc
   - 180–120s left: 70% confidence, 25% alloc
@@ -519,6 +537,11 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 | `BET_WINDOW_START_SECS` | `240` | Start evaluating at T-240s |
 | `BET_WINDOW_END_SECS` | `8` | Stop placing bets at T-8s |
 | `FLAT_CUTOFF_PCT` | `0.015` | Minimum BTC move % to consider |
+| `BTC_ANNUAL_VOL` | `0.60` | Fallback annualized volatility (used when realized vol unavailable) |
+| `VOL_MOVE_MULTIPLIER` | `0.39` | Strategy 1: `min_move = price × σ_5min × 0.39` (≈$60 at 60% vol) |
+| `S2_VOL_MOVE_MULTIPLIER` | `0.42` | Strategy 2: `min_move = price × σ_5min × 0.42` (≈$65 at 60% vol) |
+| `EARLY_MIN_DOLLAR_MOVE` | `60.0` | Fallback min dollar move for S1 (used when no realized vol) |
+| `S2_MIN_DOLLAR_MOVE` | `65.0` | Fallback min dollar move for S2 (used when no realized vol) |
 | `MAX_PM_DRIFT` | `0.10` | Max PM drift (10c) — Strategy 1 only |
 | `MIN_EDGE_PCT` | `0.03` | Minimum net edge (3%) — Strategy 1 |
 | `MAX_PRICE_STALENESS_MS` | `20,000` | Reject BTC price older than 20s |
@@ -526,7 +549,7 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 
 ### Strategy 1 (Impulse) Tiers
 
-**Early (T-240s to T-45s)** — $60 min dollar move + confidence:
+**Early (T-240s to T-45s)** — dynamic min dollar move + confidence:
 | Seconds Left | Min Confidence | Budget Allocation |
 |-------------|---------------|-------------------|
 | 120–45s | 70% | 30% ($0.60) |
@@ -545,7 +568,7 @@ Posts JSON `{"content": "..."}` to Discord webhook URL. Truncates to 1950 chars 
 |----------|-------|-------------|
 | `S2_WINDOW_START_SECS` | `240` | Operates from T-240s |
 | `S2_WINDOW_END_SECS` | `60` | Stops at T-60s |
-| `S2_MIN_DOLLAR_MOVE` | `$65` | Higher dollar floor |
+| `S2_MIN_DOLLAR_MOVE` | `$65` | Fallback dollar floor (used when no realized vol) |
 | `S2_MIN_EDGE_PCT` | `0.02` | More lenient edge (2%) |
 
 ### Strategy 2 (Momentum) Tiers

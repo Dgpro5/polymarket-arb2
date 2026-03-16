@@ -41,12 +41,35 @@ pub struct BetDecision {
 // ── Shared helpers ─────────────────────────────────────────────────────────
 
 /// Compute confidence: P(BTC stays on same side of price-to-beat) given remaining vol.
-fn compute_confidence(abs_pct: f64, secs_remaining: u64) -> f64 {
-    let mins_per_year: f64 = 525_600.0;
-    let sigma_remaining =
-        BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt();
+/// Uses realized volatility if available, falls back to BTC_ANNUAL_VOL constant.
+fn compute_confidence(abs_pct: f64, secs_remaining: u64, realized_sigma_5min: Option<f64>) -> f64 {
+    let sigma_remaining = match realized_sigma_5min {
+        Some(s5) => {
+            // Scale realized 5-min sigma to remaining time:
+            // σ_remaining = σ_5min × √(secs_remaining / 300)
+            s5 * (secs_remaining as f64 / 300.0).sqrt()
+        }
+        None => {
+            // Fallback: derive from annualized constant
+            let mins_per_year: f64 = 525_600.0;
+            BTC_ANNUAL_VOL / mins_per_year.sqrt() * (secs_remaining as f64 / 60.0).sqrt()
+        }
+    };
     let z = abs_pct / sigma_remaining;
     approx_normal_cdf(z)
+}
+
+/// Compute dynamic minimum dollar move threshold from realized volatility.
+/// Falls back to the fixed constant if realized vol is unavailable.
+fn dynamic_min_dollar_move(btc_price: f64, realized_sigma_5min: Option<f64>, multiplier: f64, fallback: f64) -> f64 {
+    match realized_sigma_5min {
+        Some(sigma) => {
+            let threshold = btc_price * sigma * multiplier;
+            // Clamp: never go below $10 or above $500
+            threshold.clamp(10.0, 500.0)
+        }
+        None => fallback,
+    }
 }
 
 /// Resolve direction + token_id from percent change.
@@ -75,6 +98,7 @@ fn evaluate_impulse(
     dollar_move: f64,
     confidence: f64,
     ms: &MarketState,
+    min_dollar_move: f64,
 ) -> Option<BetDecision> {
     // Guard: only within Strategy 1 window
     if secs_remaining > BET_WINDOW_START_SECS || secs_remaining < BET_WINDOW_END_SECS {
@@ -86,8 +110,8 @@ fn evaluate_impulse(
     let alloc_frac;
 
     if is_early {
-        // EARLY window: $60 floor + tiered confidence gate
-        if dollar_move < EARLY_MIN_DOLLAR_MOVE {
+        // EARLY window: dynamic dollar floor + tiered confidence gate
+        if dollar_move < min_dollar_move {
             return None;
         }
         match find_early_tier(secs_remaining, confidence) {
@@ -182,14 +206,15 @@ fn evaluate_momentum(
     dollar_move: f64,
     confidence: f64,
     ms: &MarketState,
+    min_dollar_move: f64,
 ) -> Option<BetDecision> {
     // Guard: only within Strategy 2 window
     if secs_remaining > S2_WINDOW_START_SECS || secs_remaining < S2_WINDOW_END_SECS {
         return None;
     }
 
-    // Dollar move floor
-    if dollar_move < S2_MIN_DOLLAR_MOVE {
+    // Dynamic dollar move floor
+    if dollar_move < min_dollar_move {
         return None;
     }
 
@@ -256,12 +281,12 @@ pub async fn evaluate_bet(
     secs_remaining: u64,
     _client: &Client,
 ) -> Option<BetDecision> {
-    // Read BTC price state
-    let (pct_change, latest_ts, btc_open, btc_current) = {
+    // Read BTC price state + realized volatility
+    let (pct_change, latest_ts, btc_open, btc_current, realized_vol) = {
         let btc = btc_state.lock().await;
         let pct = btc.pct_change()?;
         let open = btc.window_open_price?;
-        (pct, btc.latest_ts, open, btc.latest_price)
+        (pct, btc.latest_ts, open, btc.latest_price, btc.realized_vol_5min())
     };
 
     // Guard: stale price data
@@ -283,22 +308,26 @@ pub async fn evaluate_bet(
         return None;
     }
 
-    // Compute confidence (shared by both strategies)
-    let confidence = compute_confidence(abs_pct, secs_remaining);
+    // Compute confidence using realized vol (or fallback to constant)
+    let confidence = compute_confidence(abs_pct, secs_remaining, realized_vol);
+
+    // Compute dynamic minimum dollar move thresholds
+    let s1_min_move = dynamic_min_dollar_move(btc_current, realized_vol, VOL_MOVE_MULTIPLIER, EARLY_MIN_DOLLAR_MOVE);
+    let s2_min_move = dynamic_min_dollar_move(btc_current, realized_vol, S2_VOL_MOVE_MULTIPLIER, S2_MIN_DOLLAR_MOVE);
 
     // Lock market state once for both strategies
     let ms = market_state.lock().await;
 
     // Try Strategy 1 first
     if let Some(decision) = evaluate_impulse(
-        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms,
+        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms, s1_min_move,
     ) {
         return Some(decision);
     }
 
     // Try Strategy 2
     if let Some(decision) = evaluate_momentum(
-        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms,
+        secs_remaining, pct_change, abs_pct, dollar_move, confidence, &ms, s2_min_move,
     ) {
         return Some(decision);
     }
